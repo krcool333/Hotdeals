@@ -1,5 +1,4 @@
-# patched_app.py
-# Patched by assistant: uses STRING_SESSION fallback, limited SOURCE_IDS, PORT from env
+# FastDeals Bot - Optimized with Admin Notify & Fixed Double Tags
 import os
 import re
 import time
@@ -13,7 +12,6 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 import aiohttp
-import json
 
 # ---------------- Load env ---------------- #
 dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -21,19 +19,18 @@ load_dotenv(dotenv_path=dotenv_path)
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-# Target channel numeric IDs (primary and optional secondary)
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))  # set to 0 or leave blank if unused
+CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))
 
 AMAZON_TAG = os.getenv("AFFILIATE_TAG", "lootfastdeals-21")
 DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK")
+ADMIN_NOTIFY = os.getenv("ADMIN_NOTIFY", "").strip()
 
 USE_EARNKARO = os.getenv("USE_EARNKARO", "false").lower() == "true"
-DEDUPE_SECONDS = int(os.getenv("DEDUPE_SECONDS", "3600"))  # default 1 hr
+DEDUPE_SECONDS = int(os.getenv("DEDUPE_SECONDS", "3600"))
 MAX_MSG_LEN = int(os.getenv("MAX_MSG_LEN", "700"))
 PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "500"))
 
-# ---------- IMPORTANT: only these 4 sources (as requested) ----------
 SOURCE_IDS = [
     -1001448358487,
     -1001767957702,
@@ -55,9 +52,9 @@ seen_urls = set()
 seen_products = {}
 last_msg_time = time.time()
 
-# ---------------- Session handling (StringSession preferred) ----------------
+# ---------------- Session handling ---------------- #
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
-SESSION_NAME = os.getenv("SESSION_NAME", "session")  # fallback file session name
+SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
 if STRING_SESSION:
     print("Using STRING_SESSION from env")
@@ -78,6 +75,18 @@ HASHTAG_SETS = [
 
 # ---------------- Helpers ---------------- #
 
+async def notify_admin(message):
+    """Send notification to admin about bot status"""
+    if not ADMIN_NOTIFY or not ADMIN_NOTIFY.startswith("@"):
+        return
+    
+    try:
+        username = ADMIN_NOTIFY[1:] if ADMIN_NOTIFY.startswith("@") else ADMIN_NOTIFY
+        await client.send_message(username, message)
+        print(f"📢 Admin notified: {message}")
+    except Exception as e:
+        print(f"⚠️ Admin notify failed: {e}")
+
 async def expand_all(text):
     """Expand short URLs like fkrt.cc, amzn.to etc."""
     urls = sum((re.findall(p, text) for p in SHORT_PATTERNS), [])
@@ -95,13 +104,21 @@ async def expand_all(text):
     return text
 
 def convert_amazon(text):
-    """Force Amazon affiliate tag"""
+    """Force Amazon affiliate tag - FIXED no double tags"""
+    # First, replace existing tags with our tag
+    text = re.sub(r'([?&])tag=[^&\s&]+', r'\1tag=' + AMAZON_TAG, text)
+    
+    # Then handle Amazon product links without tags
     pat = r'(https?://(?:www\.)?amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10}))'
     def repl(m):
         asin = m.group(2)
-        return f"https://www.amazon.in/dp/{asin}/?tag={AMAZON_TAG}"
+        # Check if URL already has query parameters
+        if '?' in m.group(1):
+            return f"{m.group(1)}&tag={AMAZON_TAG}"
+        else:
+            return f"https://www.amazon.in/dp/{asin}/?tag={AMAZON_TAG}"
     text = re.sub(pat, repl, text, flags=re.I)
-    text = re.sub(r'([?&])tag=[^&\s]+', r'\1tag=' + AMAZON_TAG, text)
+    
     return text
 
 async def convert_earnkaro(text):
@@ -204,6 +221,10 @@ async def send_to_telegram_channels(message):
 async def bot_main():
     global last_msg_time, seen_urls, seen_products
     await client.start()
+    
+    # Notify admin that bot started
+    await notify_admin("🤖 Bot started successfully! Monitoring 4 source groups.")
+    
     sources = []
     for i in SOURCE_IDS:
         try:
@@ -212,6 +233,7 @@ async def bot_main():
             print(f"✅ Connected source: {e.title} ({i})")
         except Exception as ex:
             print(f"❌ Failed source {i}: {ex}")
+            await notify_admin(f"❌ Failed to connect to source {i}: {ex}")
 
     print(f"📢 Target channels: {CHANNEL_ID} (Primary), {CHANNEL_ID_2} (Secondary)")
 
@@ -225,60 +247,66 @@ async def bot_main():
 
         print(f"📨 Raw message: {raw_txt[:120]}...")
         
-        processed = await process(raw_txt)
-        urls = re.findall(r"https?://\S+", processed)
+        try:
+            processed = await process(raw_txt)
+            urls = re.findall(r"https?://\S+", processed)
 
-        now = time.time()
-        dedupe_keys = []
+            now = time.time()
+            dedupe_keys = []
 
-        # Dedup by product URL
-        for u in urls:
-            c = canonicalize(u)
-            if c:
-                last_seen = seen_products.get(c)
-                if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
-                    dedupe_keys.append(c)
-                else:
-                    print(f"⚠️ Duplicate URL skipped: {c}")
+            # Dedup by product URL
+            for u in urls:
+                c = canonicalize(u)
+                if c:
+                    last_seen = seen_products.get(c)
+                    if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
+                        dedupe_keys.append(c)
+                    else:
+                        print(f"⚠️ Duplicate URL skipped: {c}")
 
-        # Dedup by text hash
-        text_key = hash_text(processed)
-        last_seen = seen_products.get(text_key)
-        if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
-            dedupe_keys.append(text_key)
-        else:
-            print(f"⚠️ Duplicate text skipped")
+            # Dedup by text hash
+            text_key = hash_text(processed)
+            last_seen = seen_products.get(text_key)
+            if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
+                dedupe_keys.append(text_key)
+            else:
+                print(f"⚠️ Duplicate text skipped")
 
-        if not dedupe_keys:
-            return
+            if not dedupe_keys:
+                return
 
-        for k in dedupe_keys:
-            seen_products[k] = now
-        for u in urls:
-            seen_urls.add(u)
+            for k in dedupe_keys:
+                seen_products[k] = now
+            for u in urls:
+                seen_urls.add(u)
 
-        # Label + hashtags
-        label = ""
-        all_urls = urls
-        if any("amazon" in u for u in all_urls):
-            label = "🔥 Amazon Deal:\n"
-        elif any("flipkart" in u for u in all_urls):
-            label = "⚡ Flipkart Deal:\n"
-        elif any("myntra" in u for u in all_urls):
-            label = "✨ Myntra Deal:\n"
-        elif any("ajio" in u for u in all_urls):
-            label = "🛍️ Ajio Deal:\n"
-        else:
-            label = "🎯 Fast Deal:\n"
+            # Label + hashtags
+            label = ""
+            all_urls = urls
+            if any("amazon" in u for u in all_urls):
+                label = "🔥 Amazon Deal:\n"
+            elif any("flipkart" in u for u in all_urls):
+                label = "⚡ Flipkart Deal:\n"
+            elif any("myntra" in u for u in all_urls):
+                label = "✨ Myntra Deal:\n"
+            elif any("ajio" in u for u in all_urls):
+                label = "🛍️ Ajio Deal:\n"
+            else:
+                label = "🎯 Fast Deal:\n"
 
-        msg = label + truncate_message(processed)
-        msg += f"\n\n{choose_hashtags()}"
+            msg = label + truncate_message(processed)
+            msg += f"\n\n{choose_hashtags()}"
 
-        # Repost: send to targets (not raw forward)
-        await send_to_telegram_channels(msg)
+            # Repost: send to targets (not raw forward)
+            await send_to_telegram_channels(msg)
 
-        last_msg_time = time.time()
-        print(f"✅ Processed at {time.strftime('%H:%M:%S')}")
+            last_msg_time = time.time()
+            print(f"✅ Processed at {time.strftime('%H:%M:%S')}")
+            
+        except Exception as ex:
+            error_msg = f"❌ Error processing message: {str(ex)}"
+            print(error_msg)
+            await notify_admin(error_msg)
 
     await client.run_until_disconnected()
 
