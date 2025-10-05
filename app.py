@@ -1,4 +1,4 @@
-# FastDeals Bot - Session Protected Version
+# FastDeals Bot - Optimized with Better Message Handling
 import os
 import re
 import time
@@ -163,22 +163,30 @@ async def process(text):
     return t
 
 def extract_product_name(text):
+    """Improved product name extraction"""
     text_no_urls = re.sub(r'https?://\S+', '', text)
+    
+    # More flexible patterns for various products
     patterns = [
-        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper)\s+[^@\n]+?(?=@|₹|http|$)",
-        r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|mm|GB|TB|MB|MHz|GHz|W|mAh|Hz|MP|K|°|'|”))+(?=@|₹|http|$)",
+        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper|Fitspire|Balaymath|Shilsjit|Glutathione|Apple|Elder|Vinegar)\s+[^@\n]+?(?=@|₹|http|$)",
+        r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|mm|GB|TB|MB|MHz|GHz|W|mAh|Hz|MP|K|°|'|”|kg|g|mg|ml|L|tabs|tablets|capsules))+(?=@|₹|http|$)",
         r"Upto\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
         r"Flat\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
+        r"([A-Za-z][^@\n]{10,}?(?=@|₹|http|\n|$))",  # Generic catch-all for longer product names
     ]
+    
     for pattern in patterns:
         match = re.search(pattern, text_no_urls, re.IGNORECASE)
         if match:
             product_name = match.group(0).strip()
+            # Clean up common prefixes
             product_name = re.sub(r'^(Upto|Flat)\s+\d+%\s+Off\s+On\s+', '', product_name, flags=re.IGNORECASE)
-            return product_name
+            if len(product_name) > 10:  # Ensure it's a meaningful name
+                return product_name
     return None
 
 def canonicalize(url):
+    """Improved URL canonicalization"""
     m = re.search(r'amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})', url, flags=re.I)
     if m:
         return f"amazon:{m.group(1)}"
@@ -193,17 +201,22 @@ def canonicalize(url):
     return None
 
 def hash_text(msg):
+    """Improved hashing - less aggressive deduplication"""
     product_name = extract_product_name(msg)
     if product_name:
         clean = re.sub(r"\s+", " ", product_name.lower())
         clean = re.sub(r"[^\w\s]", "", clean)
-        return hashlib.md5(clean.encode()).hexdigest()
+        # Only use product name if it's substantial
+        if len(clean) > 15:
+            return hashlib.md5(clean.encode()).hexdigest()
+    
+    # Fallback: use first 100 chars + URLs for hash
     clean = re.sub(r"\s+", " ", msg.lower())
-    clean = re.sub(r'https?://\S+', '', clean)
-    clean = re.sub(r'₹\s*\d+', '', clean)
-    clean = re.sub(r'\d+%', '', clean)
-    clean = re.sub(r'[^\w\s]', '', clean)
-    return hashlib.md5(clean.encode()).hexdigest()
+    urls = re.findall(r'https?://\S+', clean)
+    url_part = "".join(urls)
+    text_part = clean[:100]
+    combined = url_part + text_part
+    return hashlib.md5(combined.encode()).hexdigest()
 
 def truncate_message(msg):
     if len(msg) <= MAX_MSG_LEN:
@@ -225,11 +238,13 @@ async def send_to_telegram_channels(message):
         try:
             await client.send_message(channel_id, message, link_preview=False)
             print(f"✅ Sent to Telegram channel {channel_id}")
+            return True
         except Exception as ex:
             print(f"❌ Telegram error for channel {channel_id}: {ex}")
             # Don't notify admin for session conflicts to avoid spam
             if "two different IP addresses" not in str(ex):
                 await notify_admin(f"❌ Channel error {channel_id}: {ex}")
+    return False
 
 # ---------------- Bot main ---------------- #
 async def bot_main():
@@ -277,34 +292,52 @@ async def bot_main():
 
         print(f"📨 Raw message: {raw_txt[:120]}...")
         
+        # Skip messages that are too short or don't contain URLs
+        urls_in_raw = re.findall(r"https?://\S+", raw_txt)
+        if len(raw_txt.strip()) < 20 and not urls_in_raw:
+            print("⚠️ Skipped: Message too short and no URLs")
+            return
+            
         try:
             processed = await process(raw_txt)
             urls = re.findall(r"https?://\S+", processed)
 
+            # If no URLs after processing, skip
+            if not urls:
+                print("⚠️ Skipped: No valid URLs found after processing")
+                return
+
             now = time.time()
             dedupe_keys = []
 
-            # Dedup by product URL
+            # Dedup by product URL (only for valid e-commerce URLs)
+            url_keys_added = 0
             for u in urls:
                 c = canonicalize(u)
                 if c:
                     last_seen = seen_products.get(c)
                     if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
                         dedupe_keys.append(c)
+                        url_keys_added += 1
+                        print(f"🔗 URL dedupe key: {c}")
                     else:
                         print(f"⚠️ Duplicate URL skipped: {c}")
 
-            # Dedup by text hash
+            # Dedup by text hash (less aggressive)
             text_key = hash_text(processed)
             last_seen = seen_products.get(text_key)
             if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
                 dedupe_keys.append(text_key)
+                print(f"📝 Text dedupe key: {text_key}")
             else:
-                print(f"⚠️ Duplicate text skipped")
+                print(f"⚠️ Duplicate text skipped: {text_key}")
 
+            # Only skip if BOTH URL and text are duplicates
             if not dedupe_keys:
+                print("⚠️ Skipped: All dedupe keys are duplicates")
                 return
 
+            # Update seen products
             for k in dedupe_keys:
                 seen_products[k] = now
             for u in urls:
@@ -327,11 +360,16 @@ async def bot_main():
             msg = label + truncate_message(processed)
             msg += f"\n\n{choose_hashtags()}"
 
-            # Repost: send to targets (not raw forward)
-            await send_to_telegram_channels(msg)
+            print(f"📤 Prepared message: {msg[:100]}...")
 
-            last_msg_time = time.time()
-            print(f"✅ Processed at {time.strftime('%H:%M:%S')}")
+            # Repost: send to targets (not raw forward)
+            success = await send_to_telegram_channels(msg)
+
+            if success:
+                last_msg_time = time.time()
+                print(f"✅ Processed at {time.strftime('%H:%M:%S')}")
+            else:
+                print(f"❌ Failed to send to channels")
             
         except Exception as ex:
             error_msg = f"❌ Error processing message: {str(ex)}"
@@ -339,6 +377,7 @@ async def bot_main():
             if "two different IP addresses" not in str(ex):
                 await notify_admin(error_msg)
 
+    print("🔄 Bot is now actively monitoring for messages...")
     await client.run_until_disconnected()
 
 # ---------------- Maintenance & HTTP ---------------- #
