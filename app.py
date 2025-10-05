@@ -1,4 +1,4 @@
-# FastDeals Bot - Flexible Channel Control
+# FastDeals Bot - Different Sources for Each Channel
 import os
 import re
 import time
@@ -23,7 +23,7 @@ API_HASH = os.getenv("API_HASH")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))
 
-# Flexible channel control
+# Channel control
 USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
 USE_CHANNEL_2 = os.getenv("USE_CHANNEL_2", "true").lower() == "true"
 
@@ -36,11 +36,20 @@ DEDUPE_SECONDS = int(os.getenv("DEDUPE_SECONDS", "3600"))
 MAX_MSG_LEN = int(os.getenv("MAX_MSG_LEN", "700"))
 PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "500"))
 
-SOURCE_IDS = [
-    -1001448358487,
-    -1001767957702,
-    -1001387180060,
-    -1001378801949
+# DIFFERENT SOURCES FOR EACH CHANNEL
+SOURCE_IDS_CHANNEL_1 = [
+    -1001448358487,  # Yaha Everything
+    -1001767957702,  # Transparent Deals
+    -1001387180060,  # Crazy Offers Deals - COD
+    -1001378801949   # UNIVERSAL DEALS
+]
+
+SOURCE_IDS_CHANNEL_2 = [
+    -1001505338947,  # Online Dealz Broadcast
+    -1001561964907,  # 2.0 LCBD Loot Deals
+    -1001450755585,  # Trending Loot Deals
+    -1001820593092,  # Steadfast Deal
+    -1001351555431   # LOOT लो!! Deals Offers
 ]
 
 SHORT_PATTERNS = [
@@ -56,6 +65,10 @@ SHORT_PATTERNS = [
 seen_urls = set()
 seen_products = {}
 last_msg_time = time.time()
+
+# Separate deduplication for each channel
+seen_channel_1 = {}
+seen_channel_2 = {}
 
 # ---------------- Session handling ---------------- #
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
@@ -232,45 +245,115 @@ def truncate_message(msg):
 def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
-async def send_to_telegram_channels(message):
-    """Send message to Telegram channels with flexible control - FIXED"""
-    channels = []
-    
-    # Add Channel 1 if enabled
-    if USE_CHANNEL_1:
-        channels.append(CHANNEL_ID)
-        print(f"📢 Channel 1 enabled: {CHANNEL_ID}")
-    
-    # Add Channel 2 if enabled and valid
-    if USE_CHANNEL_2 and CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0:
-        channels.append(int(CHANNEL_ID_2))
-        print(f"📢 Channel 2 enabled: {CHANNEL_ID_2}")
-    
-    if not channels:
-        print("❌ No channels enabled! Check USE_CHANNEL_1 and USE_CHANNEL_2 settings")
-        await notify_admin("🚨 No channels enabled! Check environment variables.")
+async def send_to_specific_channel(message, channel_id, channel_name):
+    """Send message to specific channel with error handling"""
+    try:
+        await client.send_message(channel_id, message, link_preview=False)
+        print(f"✅ Sent to {channel_name} ({channel_id})")
+        return True
+    except Exception as ex:
+        print(f"❌ Telegram error for {channel_name} ({channel_id}): {ex}")
+        if "two different IP addresses" not in str(ex):
+            await notify_admin(f"❌ {channel_name} error ({channel_id}): {ex}")
         return False
+
+async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
+    """Process message and send to specific channel with separate deduplication"""
+    if not raw_txt:
+        return False
+
+    print(f"📨 [{channel_name}] Raw message: {raw_txt[:120]}...")
     
-    print(f"🎯 Sending to {len(channels)} channel(s): {channels}")
-    
-    success_count = 0
-    for channel_id in channels:
-        try:
-            await client.send_message(channel_id, message, link_preview=False)
-            print(f"✅ Sent to Telegram channel {channel_id}")
-            success_count += 1
-        except Exception as ex:
-            print(f"❌ Telegram error for channel {channel_id}: {ex}")
-            # Don't notify admin for session conflicts to avoid spam
-            if "two different IP addresses" not in str(ex):
-                await notify_admin(f"❌ Channel error {channel_id}: {ex}")
-    
-    print(f"📊 Sent successfully to {success_count}/{len(channels)} channels")
-    return success_count > 0
+    # Skip messages that are too short or don't contain URLs
+    urls_in_raw = re.findall(r"https?://\S+", raw_txt)
+    if len(raw_txt.strip()) < 20 and not urls_in_raw:
+        print(f"⚠️ [{channel_name}] Skipped: Message too short and no URLs")
+        return False
+        
+    try:
+        processed = await process(raw_txt)
+        urls = re.findall(r"https?://\S+", processed)
+
+        # If no URLs after processing, skip
+        if not urls:
+            print(f"⚠️ [{channel_name}] Skipped: No valid URLs found after processing")
+            return False
+
+        now = time.time()
+        dedupe_keys = []
+
+        # Dedup by product URL (only for valid e-commerce URLs)
+        for u in urls:
+            c = canonicalize(u)
+            if c:
+                last_seen = seen_dict.get(c)
+                if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
+                    dedupe_keys.append(c)
+                    print(f"🔗 [{channel_name}] URL dedupe key: {c}")
+                else:
+                    print(f"⚠️ [{channel_name}] Duplicate URL skipped: {c}")
+
+        # Dedup by text hash (less aggressive)
+        text_key = hash_text(processed)
+        last_seen = seen_dict.get(text_key)
+        if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
+            dedupe_keys.append(text_key)
+            print(f"📝 [{channel_name}] Text dedupe key: {text_key}")
+        else:
+            print(f"⚠️ [{channel_name}] Duplicate text skipped: {text_key}")
+
+        # Only skip if BOTH URL and text are duplicates
+        if not dedupe_keys:
+            print(f"⚠️ [{channel_name}] Skipped: All dedupe keys are duplicates")
+            return False
+
+        # Update seen products for this channel
+        for k in dedupe_keys:
+            seen_dict[k] = now
+        for u in urls:
+            seen_urls.add(u)
+
+        # Label + hashtags
+        label = ""
+        all_urls = urls
+        if any("amazon" in u for u in all_urls):
+            label = "🔥 Amazon Deal:\n"
+        elif any("flipkart" in u for u in all_urls):
+            label = "⚡ Flipkart Deal:\n"
+        elif any("myntra" in u for u in all_urls):
+            label = "✨ Myntra Deal:\n"
+        elif any("ajio" in u for u in all_urls):
+            label = "🛍️ Ajio Deal:\n"
+        else:
+            label = "🎯 Fast Deal:\n"
+
+        msg = label + truncate_message(processed)
+        msg += f"\n\n{choose_hashtags()}"
+
+        print(f"📤 [{channel_name}] Prepared message: {msg[:100]}...")
+
+        # Send to specific channel
+        success = await send_to_specific_channel(msg, target_channel, channel_name)
+
+        if success:
+            global last_msg_time
+            last_msg_time = time.time()
+            print(f"✅ [{channel_name}] Processed at {time.strftime('%H:%M:%S')}")
+            return True
+        else:
+            print(f"❌ [{channel_name}] Failed to send")
+            return False
+        
+    except Exception as ex:
+        error_msg = f"❌ [{channel_name}] Error processing message: {str(ex)}"
+        print(error_msg)
+        if "two different IP addresses" not in str(ex):
+            await notify_admin(error_msg)
+        return False
 
 # ---------------- Bot main ---------------- #
 async def bot_main():
-    global last_msg_time, seen_urls, seen_products
+    global last_msg_time, seen_urls, seen_products, seen_channel_1, seen_channel_2
     
     # Validate session first
     try:
@@ -290,119 +373,60 @@ async def bot_main():
         return
     
     # Notify admin that bot started
-    await notify_admin("🤖 Bot started successfully! Monitoring 4 source groups.")
+    await notify_admin("🤖 Bot started successfully! Monitoring different sources for each channel.")
     
-    sources = []
-    for i in SOURCE_IDS:
-        try:
-            e = await client.get_entity(i)
-            sources.append(e.id)
-            print(f"✅ Connected source: {e.title} ({i})")
-        except Exception as ex:
-            print(f"❌ Failed source {i}: {ex}")
-            await notify_admin(f"❌ Failed to connect to source {i}: {ex}")
+    # Connect to sources for Channel 1
+    sources_channel_1 = []
+    if USE_CHANNEL_1:
+        for i in SOURCE_IDS_CHANNEL_1:
+            try:
+                e = await client.get_entity(i)
+                sources_channel_1.append(e.id)
+                print(f"✅ [Channel 1] Connected source: {e.title} ({i})")
+            except Exception as ex:
+                print(f"❌ [Channel 1] Failed source {i}: {ex}")
+                await notify_admin(f"❌ [Channel 1] Failed to connect to source {i}: {ex}")
 
-    # Show channel configuration
+    # Connect to sources for Channel 2
+    sources_channel_2 = []
+    if USE_CHANNEL_2 and CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0:
+        for i in SOURCE_IDS_CHANNEL_2:
+            try:
+                e = await client.get_entity(i)
+                sources_channel_2.append(e.id)
+                print(f"✅ [Channel 2] Connected source: {e.title} ({i})")
+            except Exception as ex:
+                print(f"❌ [Channel 2] Failed source {i}: {ex}")
+                await notify_admin(f"❌ [Channel 2] Failed to connect to source {i}: {ex}")
+
+    # Show configuration
     print(f"🎯 Channel Configuration:")
-    print(f"   Primary Channel: {CHANNEL_ID} ({'ENABLED' if USE_CHANNEL_1 else 'DISABLED'})")
-    print(f"   Secondary Channel: {CHANNEL_ID_2} ({'ENABLED' if USE_CHANNEL_2 else 'DISABLED'})")
+    print(f"   Channel 1: {CHANNEL_ID} ({'ENABLED' if USE_CHANNEL_1 else 'DISABLED'}) - {len(sources_channel_1)} sources")
+    print(f"   Channel 2: {CHANNEL_ID_2} ({'ENABLED' if USE_CHANNEL_2 else 'DISABLED'}) - {len(sources_channel_2)} sources")
 
-    @client.on(events.NewMessage(chats=sources))
-    async def handler(e):
-        global seen_products, seen_urls, last_msg_time
+    # Handler for Channel 1 sources
+    if USE_CHANNEL_1 and sources_channel_1:
+        @client.on(events.NewMessage(chats=sources_channel_1))
+        async def handler_channel_1(e):
+            await process_and_send(
+                e.message.message or "", 
+                CHANNEL_ID, 
+                "Channel 1", 
+                seen_channel_1
+            )
 
-        raw_txt = e.message.message or ""
-        if not raw_txt:
-            return
+    # Handler for Channel 2 sources
+    if USE_CHANNEL_2 and sources_channel_2:
+        @client.on(events.NewMessage(chats=sources_channel_2))
+        async def handler_channel_2(e):
+            await process_and_send(
+                e.message.message or "", 
+                int(CHANNEL_ID_2), 
+                "Channel 2", 
+                seen_channel_2
+            )
 
-        print(f"📨 Raw message: {raw_txt[:120]}...")
-        
-        # Skip messages that are too short or don't contain URLs
-        urls_in_raw = re.findall(r"https?://\S+", raw_txt)
-        if len(raw_txt.strip()) < 20 and not urls_in_raw:
-            print("⚠️ Skipped: Message too short and no URLs")
-            return
-            
-        try:
-            processed = await process(raw_txt)
-            urls = re.findall(r"https?://\S+", processed)
-
-            # If no URLs after processing, skip
-            if not urls:
-                print("⚠️ Skipped: No valid URLs found after processing")
-                return
-
-            now = time.time()
-            dedupe_keys = []
-
-            # Dedup by product URL (only for valid e-commerce URLs)
-            url_keys_added = 0
-            for u in urls:
-                c = canonicalize(u)
-                if c:
-                    last_seen = seen_products.get(c)
-                    if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
-                        dedupe_keys.append(c)
-                        url_keys_added += 1
-                        print(f"🔗 URL dedupe key: {c}")
-                    else:
-                        print(f"⚠️ Duplicate URL skipped: {c}")
-
-            # Dedup by text hash (less aggressive)
-            text_key = hash_text(processed)
-            last_seen = seen_products.get(text_key)
-            if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
-                dedupe_keys.append(text_key)
-                print(f"📝 Text dedupe key: {text_key}")
-            else:
-                print(f"⚠️ Duplicate text skipped: {text_key}")
-
-            # Only skip if BOTH URL and text are duplicates
-            if not dedupe_keys:
-                print("⚠️ Skipped: All dedupe keys are duplicates")
-                return
-
-            # Update seen products
-            for k in dedupe_keys:
-                seen_products[k] = now
-            for u in urls:
-                seen_urls.add(u)
-
-            # Label + hashtags
-            label = ""
-            all_urls = urls
-            if any("amazon" in u for u in all_urls):
-                label = "🔥 Amazon Deal:\n"
-            elif any("flipkart" in u for u in all_urls):
-                label = "⚡ Flipkart Deal:\n"
-            elif any("myntra" in u for u in all_urls):
-                label = "✨ Myntra Deal:\n"
-            elif any("ajio" in u for u in all_urls):
-                label = "🛍️ Ajio Deal:\n"
-            else:
-                label = "🎯 Fast Deal:\n"
-
-            msg = label + truncate_message(processed)
-            msg += f"\n\n{choose_hashtags()}"
-
-            print(f"📤 Prepared message: {msg[:100]}...")
-
-            # Repost: send to targets (not raw forward)
-            success = await send_to_telegram_channels(msg)
-
-            if success:
-                last_msg_time = time.time()
-                print(f"✅ Processed at {time.strftime('%H:%M:%S')}")
-            else:
-                print(f"❌ Failed to send to channels")
-            
-        except Exception as ex:
-            error_msg = f"❌ Error processing message: {str(ex)}"
-            print(error_msg)
-            if "two different IP addresses" not in str(ex):
-                await notify_admin(error_msg)
-
-    print("🔄 Bot is now actively monitoring for messages...")
+    print("🔄 Bot is now actively monitoring different sources for each channel...")
     await client.run_until_disconnected()
 
 # ---------------- Maintenance & HTTP ---------------- #
@@ -443,7 +467,9 @@ def home():
         "telegram_primary": CHANNEL_ID, 
         "telegram_secondary": CHANNEL_ID_2,
         "channel_1_enabled": USE_CHANNEL_1,
-        "channel_2_enabled": USE_CHANNEL_2
+        "channel_2_enabled": USE_CHANNEL_2,
+        "channel_1_sources": len(SOURCE_IDS_CHANNEL_1),
+        "channel_2_sources": len(SOURCE_IDS_CHANNEL_2)
     })
 
 @app.route("/ping")
@@ -465,7 +491,9 @@ def stats():
         "last_message_time": last_msg_time,
         "telegram_channels": [CHANNEL_ID, CHANNEL_ID_2] if CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0 else [CHANNEL_ID],
         "channel_1_enabled": USE_CHANNEL_1,
-        "channel_2_enabled": USE_CHANNEL_2
+        "channel_2_enabled": USE_CHANNEL_2,
+        "channel_1_sources_count": len(SOURCE_IDS_CHANNEL_1),
+        "channel_2_sources_count": len(SOURCE_IDS_CHANNEL_2)
     })
 
 @app.route("/redeploy", methods=["POST"])
