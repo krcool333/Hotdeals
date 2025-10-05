@@ -1,4 +1,4 @@
-# FastDeals Bot - Optimized with Better Message Handling
+# FastDeals Bot - Flexible Channel Control
 import os
 import re
 import time
@@ -22,6 +22,10 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))
+
+# Flexible channel control
+USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
+USE_CHANNEL_2 = os.getenv("USE_CHANNEL_2", "true").lower() == "true"
 
 AMAZON_TAG = os.getenv("AFFILIATE_TAG", "lootfastdeals-21")
 DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK")
@@ -229,22 +233,40 @@ def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
 async def send_to_telegram_channels(message):
-    """Send message to both Telegram channels with error handling"""
-    channels = [CHANNEL_ID]
-    if CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0:
-        channels.append(int(CHANNEL_ID_2))
+    """Send message to Telegram channels with flexible control - FIXED"""
+    channels = []
     
+    # Add Channel 1 if enabled
+    if USE_CHANNEL_1:
+        channels.append(CHANNEL_ID)
+        print(f"📢 Channel 1 enabled: {CHANNEL_ID}")
+    
+    # Add Channel 2 if enabled and valid
+    if USE_CHANNEL_2 and CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0:
+        channels.append(int(CHANNEL_ID_2))
+        print(f"📢 Channel 2 enabled: {CHANNEL_ID_2}")
+    
+    if not channels:
+        print("❌ No channels enabled! Check USE_CHANNEL_1 and USE_CHANNEL_2 settings")
+        await notify_admin("🚨 No channels enabled! Check environment variables.")
+        return False
+    
+    print(f"🎯 Sending to {len(channels)} channel(s): {channels}")
+    
+    success_count = 0
     for channel_id in channels:
         try:
             await client.send_message(channel_id, message, link_preview=False)
             print(f"✅ Sent to Telegram channel {channel_id}")
-            return True
+            success_count += 1
         except Exception as ex:
             print(f"❌ Telegram error for channel {channel_id}: {ex}")
             # Don't notify admin for session conflicts to avoid spam
             if "two different IP addresses" not in str(ex):
                 await notify_admin(f"❌ Channel error {channel_id}: {ex}")
-    return False
+    
+    print(f"📊 Sent successfully to {success_count}/{len(channels)} channels")
+    return success_count > 0
 
 # ---------------- Bot main ---------------- #
 async def bot_main():
@@ -280,7 +302,10 @@ async def bot_main():
             print(f"❌ Failed source {i}: {ex}")
             await notify_admin(f"❌ Failed to connect to source {i}: {ex}")
 
-    print(f"📢 Target channels: {CHANNEL_ID} (Primary), {CHANNEL_ID_2} (Secondary)")
+    # Show channel configuration
+    print(f"🎯 Channel Configuration:")
+    print(f"   Primary Channel: {CHANNEL_ID} ({'ENABLED' if USE_CHANNEL_1 else 'DISABLED'})")
+    print(f"   Secondary Channel: {CHANNEL_ID_2} ({'ENABLED' if USE_CHANNEL_2 else 'DISABLED'})")
 
     @client.on(events.NewMessage(chats=sources))
     async def handler(e):
@@ -416,7 +441,9 @@ def home():
     return jsonify({
         "status": "running", 
         "telegram_primary": CHANNEL_ID, 
-        "telegram_secondary": CHANNEL_ID_2
+        "telegram_secondary": CHANNEL_ID_2,
+        "channel_1_enabled": USE_CHANNEL_1,
+        "channel_2_enabled": USE_CHANNEL_2
     })
 
 @app.route("/ping")
@@ -436,7 +463,9 @@ def stats():
     return jsonify({
         "unique_links": len(seen_urls), 
         "last_message_time": last_msg_time,
-        "telegram_channels": [CHANNEL_ID, CHANNEL_ID_2] if CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0 else [CHANNEL_ID]
+        "telegram_channels": [CHANNEL_ID, CHANNEL_ID_2] if CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0 else [CHANNEL_ID],
+        "channel_1_enabled": USE_CHANNEL_1,
+        "channel_2_enabled": USE_CHANNEL_2
     })
 
 @app.route("/redeploy", methods=["POST"])
