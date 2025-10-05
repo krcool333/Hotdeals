@@ -1,4 +1,4 @@
-# FastDeals Bot - Optimized with Admin Notify & Fixed Double Tags
+# FastDeals Bot - Session Protected Version
 import os
 import re
 import time
@@ -6,6 +6,7 @@ import requests
 import asyncio
 import hashlib
 import random
+import atexit
 from threading import Thread
 from flask import Flask, jsonify, request
 from telethon import TelegramClient, events
@@ -73,8 +74,19 @@ HASHTAG_SETS = [
     "#PriceDrop #FlashSale #DealAlert",
 ]
 
-# ---------------- Helpers ---------------- #
+# ---------------- Graceful shutdown ---------------- #
+def cleanup():
+    """Ensure session is properly closed"""
+    try:
+        if client.is_connected():
+            client.disconnect()
+            print("✅ Session properly closed")
+    except:
+        pass
 
+atexit.register(cleanup)
+
+# ---------------- Helpers ---------------- #
 async def notify_admin(message):
     """Send notification to admin about bot status"""
     if not ADMIN_NOTIFY or not ADMIN_NOTIFY.startswith("@"):
@@ -215,12 +227,30 @@ async def send_to_telegram_channels(message):
             print(f"✅ Sent to Telegram channel {channel_id}")
         except Exception as ex:
             print(f"❌ Telegram error for channel {channel_id}: {ex}")
+            # Don't notify admin for session conflicts to avoid spam
+            if "two different IP addresses" not in str(ex):
+                await notify_admin(f"❌ Channel error {channel_id}: {ex}")
 
 # ---------------- Bot main ---------------- #
-
 async def bot_main():
     global last_msg_time, seen_urls, seen_products
-    await client.start()
+    
+    # Validate session first
+    try:
+        await client.start()
+        me = await client.get_me()
+        print(f"✅ Logged in as: {me.first_name} (ID: {me.id})")
+        
+        # Test connection
+        await client.get_me()
+        print("✅ Session validation successful")
+        
+    except Exception as e:
+        error_msg = f"❌ Session validation failed: {e}"
+        print(error_msg)
+        if "two different IP addresses" in str(e):
+            await notify_admin("🚨 CRITICAL: Session conflict! Generate NEW STRING_SESSION")
+        return
     
     # Notify admin that bot started
     await notify_admin("🤖 Bot started successfully! Monitoring 4 source groups.")
@@ -306,12 +336,12 @@ async def bot_main():
         except Exception as ex:
             error_msg = f"❌ Error processing message: {str(ex)}"
             print(error_msg)
-            await notify_admin(error_msg)
+            if "two different IP addresses" not in str(ex):
+                await notify_admin(error_msg)
 
     await client.run_until_disconnected()
 
 # ---------------- Maintenance & HTTP ---------------- #
-
 def redeploy():
     if not DEPLOY_HOOK:
         return False
@@ -342,7 +372,6 @@ def start_loop(loop):
     loop.run_until_complete(bot_main())
 
 # ---------------- Flask endpoints ---------------- #
-
 @app.route("/")
 def home():
     return jsonify({
@@ -376,7 +405,6 @@ def redeploy_endpoint():
     return ("ok", 200) if redeploy() else ("fail", 500)
 
 # ---------------- Entrypoint ---------------- #
-
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     Thread(target=start_loop, args=(loop,), daemon=True).start()
