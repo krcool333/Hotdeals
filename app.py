@@ -36,6 +36,9 @@ DEDUPE_SECONDS = int(os.getenv("DEDUPE_SECONDS", "3600"))
 MAX_MSG_LEN = int(os.getenv("MAX_MSG_LEN", "700"))
 PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "500"))
 
+# NEW: External URL for pinging
+EXTERNAL_URL = os.getenv("EXTERNAL_URL", "https://hotdeals.onrender.com")
+
 # DIFFERENT SOURCES FOR EACH CHANNEL
 SOURCE_IDS_CHANNEL_1 = [
     -1001448358487,  # Yaha Everything
@@ -440,12 +443,26 @@ def redeploy():
         return False
 
 def keep_alive():
+    """Enhanced keep_alive with external URL pinging to prevent Render sleep"""
     while True:
-        time.sleep(14 * 60)
+        time.sleep(300)  # Ping every 5 minutes instead of 14
+        
+        # Ping local instance
         try:
             requests.get("http://127.0.0.1:10000/ping", timeout=5)
-        except:
-            pass
+            print("✅ Internal ping successful")
+        except Exception as e:
+            print(f"⚠️ Internal ping failed: {e}")
+        
+        # Ping external Render URL to prevent sleep
+        if EXTERNAL_URL:
+            try:
+                response = requests.get(f"{EXTERNAL_URL}/ping", timeout=10)
+                print(f"✅ External ping successful: {response.status_code}")
+            except Exception as e:
+                print(f"⚠️ External ping failed: {e}")
+        else:
+            print("ℹ️ No EXTERNAL_URL set, skipping external ping")
 
 def monitor_health():
     global last_msg_time
