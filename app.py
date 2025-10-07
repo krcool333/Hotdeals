@@ -1,25 +1,32 @@
-# FastDeals Bot - Different Sources for Each Channel
+# app.py - FASTDEALS Bot (ready-to-paste)
+# Preserves your per-channel source routing and in-memory dedupe.
+# Adds: aiohttp EarnKaro, rate-limiter, Render API deploy helper, safer monitor.
+
 import os
 import re
 import time
-import requests
-import asyncio
 import hashlib
 import random
+import asyncio
 import atexit
+import requests
 from threading import Thread
 from flask import Flask, jsonify, request
+import aiohttp
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
-import aiohttp
 
 # ---------------- Load env ---------------- #
 dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(dotenv_path=dotenv_path)
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
+SESSION_NAME = os.getenv("SESSION_NAME", "session")
+
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))
 
@@ -27,19 +34,31 @@ CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))
 USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
 USE_CHANNEL_2 = os.getenv("USE_CHANNEL_2", "true").lower() == "true"
 
-AMAZON_TAG = os.getenv("AFFILIATE_TAG", "lootfastdeals-21")
-DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK")
-ADMIN_NOTIFY = os.getenv("ADMIN_NOTIFY", "").strip()
-
+AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "lootfastdeals-21")
 USE_EARNKARO = os.getenv("USE_EARNKARO", "false").lower() == "true"
+
 DEDUPE_SECONDS = int(os.getenv("DEDUPE_SECONDS", "3600"))
 MAX_MSG_LEN = int(os.getenv("MAX_MSG_LEN", "700"))
 PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "500"))
 
-# NEW: External URL for pinging
-EXTERNAL_URL = os.getenv("EXTERNAL_URL", "https://hotdeals.onrender.com")
+ADMIN_NOTIFY = os.getenv("ADMIN_NOTIFY", "").strip()  # e.g. @kr_cool
+RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", "").strip()
 
-# DIFFERENT SOURCES FOR EACH CHANNEL
+# Render API credentials (you provided these values)
+RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
+
+PORT = int(os.getenv("PORT", "10000"))
+EXTERNAL_URL = os.getenv("EXTERNAL_URL", "").strip()
+
+# Rate limiting & backoff
+MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))  # default 60s
+MIN_JITTER = int(os.getenv("MIN_JITTER", "3"))
+MAX_JITTER = int(os.getenv("MAX_JITTER", "12"))
+MAX_REDEPLOYS_PER_DAY = int(os.getenv("MAX_REDEPLOYS_PER_DAY", "3"))
+REDEPLOY_BACKOFF_BASE = int(os.getenv("REDEPLOY_BACKOFF_BASE", "60"))
+
+# ---------------- DIFFERENT SOURCES ---------------- #
 SOURCE_IDS_CHANNEL_1 = [
     -1001448358487,  # Yaha Everything
     -1001767957702,  # Transparent Deals
@@ -64,19 +83,24 @@ SHORT_PATTERNS = [
     r"(https?://fkt\.co/\S+)"
 ]
 
-# ---------------- Runtime state ---------------- #
+HASHTAG_SETS = [
+    "#LootDeals #Discount #OnlineShopping",
+    "#Free #Offer #Sale",
+    "#TopDeals #BigSale #BestPrice",
+    "#PriceDrop #FlashSale #DealAlert",
+]
+
+# ---------------- Runtime in-memory state (no Redis) ---------------- #
 seen_urls = set()
 seen_products = {}
-last_msg_time = time.time()
-
-# Separate deduplication for each channel
 seen_channel_1 = {}
 seen_channel_2 = {}
+last_msg_time = time.time()
+last_sent_channel = {}   # channel_name -> timestamp
+redeploy_count_today = 0
+last_redeploy_time = 0
 
 # ---------------- Session handling ---------------- #
-STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
-SESSION_NAME = os.getenv("SESSION_NAME", "session")
-
 if STRING_SESSION:
     print("Using STRING_SESSION from env")
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -86,48 +110,39 @@ else:
 
 app = Flask(__name__)
 
-# Rotating hashtags pool
-HASHTAG_SETS = [
-    "#LootDeals #Discount #OnlineShopping",
-    "#Free #Offer #Sale",
-    "#TopDeals #BigSale #BestPrice",
-    "#PriceDrop #FlashSale #DealAlert",
-]
-
 # ---------------- Graceful shutdown ---------------- #
 def cleanup():
-    """Ensure session is properly closed"""
     try:
         if client.is_connected():
             client.disconnect()
             print("✅ Session properly closed")
-    except:
+    except Exception:
         pass
 
 atexit.register(cleanup)
 
 # ---------------- Helpers ---------------- #
 async def notify_admin(message):
-    """Send notification to admin about bot status"""
-    if not ADMIN_NOTIFY or not ADMIN_NOTIFY.startswith("@"):
+    """Send notification to admin (via user session)."""
+    if not ADMIN_NOTIFY:
         return
-    
     try:
-        username = ADMIN_NOTIFY[1:] if ADMIN_NOTIFY.startswith("@") else ADMIN_NOTIFY
-        await client.send_message(username, message)
+        target = ADMIN_NOTIFY[1:] if ADMIN_NOTIFY.startswith("@") else ADMIN_NOTIFY
+        await client.send_message(target, message)
         print(f"📢 Admin notified: {message}")
     except Exception as e:
         print(f"⚠️ Admin notify failed: {e}")
 
 async def expand_all(text):
-    """Expand short URLs like fkrt.cc, amzn.to etc."""
+    """Expand short URLs like fkrt.cc, amzn.to etc (async)."""
     urls = sum((re.findall(p, text) for p in SHORT_PATTERNS), [])
     if not urls:
         return text
-    async with aiohttp.ClientSession() as s:
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
         for u in urls:
             try:
-                async with s.head(u, allow_redirects=True, timeout=5) as r:
+                async with s.head(u, allow_redirects=True) as r:
                     expanded_url = str(r.url)
                     text = text.replace(u, expanded_url)
                     print(f"🔗 Expanded {u} → {expanded_url}")
@@ -136,44 +151,45 @@ async def expand_all(text):
     return text
 
 def convert_amazon(text):
-    """Force Amazon affiliate tag - FIXED no double tags"""
-    # First, replace existing tags with our tag
-    text = re.sub(r'([?&])tag=[^&\s&]+', r'\1tag=' + AMAZON_TAG, text)
-    
-    # Then handle Amazon product links without tags
+    """Force Amazon affiliate tag (replace existing tag or add ours)."""
+    # Replace existing tag parameters
+    text = re.sub(r'([?&])tag=[^&\s&]+', r'\1tag=' + AFFILIATE_TAG, text)
+    # Handle Amazon product links without tags
     pat = r'(https?://(?:www\.)?amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10}))'
     def repl(m):
         asin = m.group(2)
-        # Check if URL already has query parameters
-        if '?' in m.group(1):
-            return f"{m.group(1)}&tag={AMAZON_TAG}"
+        url = m.group(1)
+        if '?' in url:
+            return f"{url}&tag={AFFILIATE_TAG}"
         else:
-            return f"https://www.amazon.in/dp/{asin}/?tag={AMAZON_TAG}"
+            return f"https://www.amazon.in/dp/{asin}/?tag={AFFILIATE_TAG}"
     text = re.sub(pat, repl, text, flags=re.I)
-    
     return text
 
 async def convert_earnkaro(text):
-    """Optional EarnKaro wrapping with fallback"""
+    """Async EarnKaro conversion (non-blocking). Fallbacks to original URL on failure."""
     if not USE_EARNKARO:
         return text
     urls = re.findall(r"(https?://\S+)", text)
-    for u in urls:
-        if any(x in u for x in ["flipkart", "myntra", "ajio"]):
-            try:
-                r = requests.post(
-                    "https://api.earnkaro.com/api/deeplink",
-                    json={"url": u},
-                    headers={"Content-Type": "application/json"},
-                    timeout=6
-                )
-                if r.status_code == 200:
-                    ek = r.json().get("data", {}).get("link")
-                    if ek:
-                        text = text.replace(u, ek)
-                        continue
-            except Exception as e:
-                print(f"⚠️ EarnKaro failed for {u}: {e}")
+    if not urls:
+        return text
+    timeout = aiohttp.ClientTimeout(total=6)
+    headers = {"Content-Type": "application/json"}
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        for u in urls:
+            if any(k in u for k in ("flipkart", "myntra", "ajio")):
+                try:
+                    async with s.post("https://api.earnkaro.com/api/deeplink", json={"url": u}, headers=headers) as resp:
+                        if resp.status == 200:
+                            js = await resp.json()
+                            ek = js.get("data", {}).get("link")
+                            if ek:
+                                text = text.replace(u, ek)
+                                print(f"🔁 EarnKaro converted for {u}")
+                        else:
+                            print(f"⚠️ EarnKaro returned {resp.status} for {u}")
+                except Exception as e:
+                    print(f"⚠️ EarnKaro failed for {u}: {e}")
     return text
 
 async def process(text):
@@ -183,30 +199,24 @@ async def process(text):
     return t
 
 def extract_product_name(text):
-    """Improved product name extraction"""
     text_no_urls = re.sub(r'https?://\S+', '', text)
-    
-    # More flexible patterns for various products
     patterns = [
-        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper|Fitspire|Balaymath|Shilsjit|Glutathione|Apple|Elder|Vinegar)\s+[^@\n]+?(?=@|₹|http|$)",
-        r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|mm|GB|TB|MB|MHz|GHz|W|mAh|Hz|MP|K|°|'|”|kg|g|mg|ml|L|tabs|tablets|capsules))+(?=@|₹|http|$)",
+        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper|Fitspire)\s+[^@\n]+?(?=@|₹|http|$)",
+        r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|GB|TB|MB|mAh|MP|Hz))+(?=@|₹|http|$)",
         r"Upto\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
         r"Flat\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
-        r"([A-Za-z][^@\n]{10,}?(?=@|₹|http|\n|$))",  # Generic catch-all for longer product names
+        r"([A-Za-z][^@\n]{10,}?(?=@|₹|http|\n|$))",
     ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text_no_urls, re.IGNORECASE)
-        if match:
-            product_name = match.group(0).strip()
-            # Clean up common prefixes
-            product_name = re.sub(r'^(Upto|Flat)\s+\d+%\s+Off\s+On\s+', '', product_name, flags=re.IGNORECASE)
-            if len(product_name) > 10:  # Ensure it's a meaningful name
-                return product_name
+    for p in patterns:
+        m = re.search(p, text_no_urls, re.IGNORECASE)
+        if m:
+            prod = m.group(0).strip()
+            prod = re.sub(r'^(Upto|Flat)\s+\d+%\s+Off\s+On\s+', '', prod, flags=re.IGNORECASE)
+            if len(prod) > 10:
+                return prod
     return None
 
 def canonicalize(url):
-    """Improved URL canonicalization"""
     m = re.search(r'amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})', url, flags=re.I)
     if m:
         return f"amazon:{m.group(1)}"
@@ -221,16 +231,12 @@ def canonicalize(url):
     return None
 
 def hash_text(msg):
-    """Improved hashing - less aggressive deduplication"""
     product_name = extract_product_name(msg)
     if product_name:
         clean = re.sub(r"\s+", " ", product_name.lower())
         clean = re.sub(r"[^\w\s]", "", clean)
-        # Only use product name if it's substantial
         if len(clean) > 15:
             return hashlib.md5(clean.encode()).hexdigest()
-    
-    # Fallback: use first 100 chars + URLs for hash
     clean = re.sub(r"\s+", " ", msg.lower())
     urls = re.findall(r'https?://\S+', clean)
     url_part = "".join(urls)
@@ -249,7 +255,6 @@ def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
 async def send_to_specific_channel(message, channel_id, channel_name):
-    """Send message to specific channel with error handling"""
     try:
         await client.send_message(channel_id, message, link_preview=False)
         print(f"✅ Sent to {channel_name} ({channel_id})")
@@ -261,23 +266,20 @@ async def send_to_specific_channel(message, channel_id, channel_name):
         return False
 
 async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
-    """Process message and send to specific channel with separate deduplication"""
     if not raw_txt:
         return False
 
     print(f"📨 [{channel_name}] Raw message: {raw_txt[:120]}...")
-    
-    # Skip messages that are too short or don't contain URLs
+
     urls_in_raw = re.findall(r"https?://\S+", raw_txt)
     if len(raw_txt.strip()) < 20 and not urls_in_raw:
         print(f"⚠️ [{channel_name}] Skipped: Message too short and no URLs")
         return False
-        
+
     try:
         processed = await process(raw_txt)
         urls = re.findall(r"https?://\S+", processed)
 
-        # If no URLs after processing, skip
         if not urls:
             print(f"⚠️ [{channel_name}] Skipped: No valid URLs found after processing")
             return False
@@ -285,7 +287,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
         now = time.time()
         dedupe_keys = []
 
-        # Dedup by product URL (only for valid e-commerce URLs)
+        # dedupe by canonical product keys
         for u in urls:
             c = canonicalize(u)
             if c:
@@ -296,7 +298,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
                 else:
                     print(f"⚠️ [{channel_name}] Duplicate URL skipped: {c}")
 
-        # Dedup by text hash (less aggressive)
+        # dedupe by text hash
         text_key = hash_text(processed)
         last_seen = seen_dict.get(text_key)
         if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
@@ -310,13 +312,13 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
             print(f"⚠️ [{channel_name}] Skipped: All dedupe keys are duplicates")
             return False
 
-        # Update seen products for this channel
+        # Update seen for this channel
         for k in dedupe_keys:
             seen_dict[k] = now
         for u in urls:
             seen_urls.add(u)
 
-        # Label + hashtags
+        # labels
         label = ""
         all_urls = urls
         if any("amazon" in u for u in all_urls):
@@ -335,18 +337,29 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
 
         print(f"📤 [{channel_name}] Prepared message: {msg[:100]}...")
 
-        # Send to specific channel
+        # --- RATE LIMIT PER CHANNEL (avoid bursts / spam flags) ---
+        now_ts = time.time()
+        last = last_sent_channel.get(channel_name, 0)
+        need_wait = MIN_INTERVAL_SECONDS + random.randint(MIN_JITTER, MAX_JITTER)
+        if (now_ts - last) < need_wait:
+            print(f"⏱️ Rate limit: skip {channel_name}. Need {int(need_wait - (now_ts - last))}s more.")
+            return False
+
+        # small jitter before sending (stagger across channels)
+        await asyncio.sleep(random.uniform(0.5, 2.5))
+
         success = await send_to_specific_channel(msg, target_channel, channel_name)
 
         if success:
             global last_msg_time
             last_msg_time = time.time()
+            last_sent_channel[channel_name] = time.time()
             print(f"✅ [{channel_name}] Processed at {time.strftime('%H:%M:%S')}")
             return True
         else:
             print(f"❌ [{channel_name}] Failed to send")
             return False
-        
+
     except Exception as ex:
         error_msg = f"❌ [{channel_name}] Error processing message: {str(ex)}"
         print(error_msg)
@@ -357,28 +370,22 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
 # ---------------- Bot main ---------------- #
 async def bot_main():
     global last_msg_time, seen_urls, seen_products, seen_channel_1, seen_channel_2
-    
-    # Validate session first
+
     try:
         await client.start()
         me = await client.get_me()
         print(f"✅ Logged in as: {me.first_name} (ID: {me.id})")
-        
-        # Test connection
         await client.get_me()
-        print("✅ Session validation successful")
-        
     except Exception as e:
         error_msg = f"❌ Session validation failed: {e}"
         print(error_msg)
         if "two different IP addresses" in str(e):
             await notify_admin("🚨 CRITICAL: Session conflict! Generate NEW STRING_SESSION")
         return
-    
-    # Notify admin that bot started
+
     await notify_admin("🤖 Bot started successfully! Monitoring different sources for each channel.")
-    
-    # Connect to sources for Channel 1
+
+    # Connect to source entities for Channel 1
     sources_channel_1 = []
     if USE_CHANNEL_1:
         for i in SOURCE_IDS_CHANNEL_1:
@@ -390,7 +397,7 @@ async def bot_main():
                 print(f"❌ [Channel 1] Failed source {i}: {ex}")
                 await notify_admin(f"❌ [Channel 1] Failed to connect to source {i}: {ex}")
 
-    # Connect to sources for Channel 2
+    # Connect to source entities for Channel 2
     sources_channel_2 = []
     if USE_CHANNEL_2 and CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0:
         for i in SOURCE_IDS_CHANNEL_2:
@@ -402,7 +409,6 @@ async def bot_main():
                 print(f"❌ [Channel 2] Failed source {i}: {ex}")
                 await notify_admin(f"❌ [Channel 2] Failed to connect to source {i}: {ex}")
 
-    # Show configuration
     print(f"🎯 Channel Configuration:")
     print(f"   Channel 1: {CHANNEL_ID} ({'ENABLED' if USE_CHANNEL_1 else 'DISABLED'}) - {len(sources_channel_1)} sources")
     print(f"   Channel 2: {CHANNEL_ID_2} ({'ENABLED' if USE_CHANNEL_2 else 'DISABLED'}) - {len(sources_channel_2)} sources")
@@ -411,82 +417,114 @@ async def bot_main():
     if USE_CHANNEL_1 and sources_channel_1:
         @client.on(events.NewMessage(chats=sources_channel_1))
         async def handler_channel_1(e):
-            await process_and_send(
-                e.message.message or "", 
-                CHANNEL_ID, 
-                "Channel 1", 
-                seen_channel_1
-            )
+            await process_and_send(e.message.message or "", CHANNEL_ID, "Channel 1", seen_channel_1)
 
     # Handler for Channel 2 sources
     if USE_CHANNEL_2 and sources_channel_2:
         @client.on(events.NewMessage(chats=sources_channel_2))
         async def handler_channel_2(e):
-            await process_and_send(
-                e.message.message or "", 
-                int(CHANNEL_ID_2), 
-                "Channel 2", 
-                seen_channel_2
-            )
+            await process_and_send(e.message.message or "", int(CHANNEL_ID_2), "Channel 2", seen_channel_2)
 
     print("🔄 Bot is now actively monitoring different sources for each channel...")
     await client.run_until_disconnected()
 
-# ---------------- Maintenance & HTTP ---------------- #
-def redeploy():
-    if not DEPLOY_HOOK:
+# ---------------- Deploy helpers & monitor ---------------- #
+def redeploy_via_hook():
+    """Use old webhook hook if provided (synchronous)."""
+    if not RENDER_DEPLOY_HOOK:
         return False
     try:
-        requests.post(DEPLOY_HOOK, timeout=10)
+        requests.post(RENDER_DEPLOY_HOOK, timeout=10)
+        print("✅ Redeploy hook fired")
         return True
-    except:
+    except Exception as e:
+        print(f"⚠️ Redeploy hook failed: {e}")
         return False
 
-def keep_alive():
-    """Enhanced keep_alive with external URL pinging to prevent Render sleep"""
+async def trigger_render_deploy_async():
+    """Trigger Render deploy via official API (async)."""
+    api_key = RENDER_API_KEY
+    service_id = RENDER_SERVICE_ID
+    if not api_key or not service_id:
+        print("ℹ️ Render API not configured")
+        return False
+    url = f"https://api.render.com/v1/services/{service_id}/deploys"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, headers=headers, json={}, timeout=15) as r:
+                text = await r.text()
+                if r.status in (200, 201):
+                    print("✅ Render API deploy triggered")
+                    return True
+                else:
+                    print(f"❌ Render API deploy failed {r.status}: {text}")
+                    return False
+    except Exception as e:
+        print(f"⚠️ Render deploy error: {e}")
+        return False
+
+def monitor_health():
+    """Background monitor that triggers redeploy with exponential backoff."""
+    global last_msg_time, redeploy_count_today, last_redeploy_time
     while True:
-        time.sleep(300)  # Ping every 5 minutes instead of 14
-        
-        # Ping local instance
+        time.sleep(300)  # check every 5 minutes
+        idle = time.time() - last_msg_time
+        if idle > 1800:
+            now = time.time()
+            if redeploy_count_today >= MAX_REDEPLOYS_PER_DAY:
+                print("⚠️ Max redeploys reached for today, skipping redeploy")
+                continue
+            wait = REDEPLOY_BACKOFF_BASE * (2 ** redeploy_count_today)
+            if (now - last_redeploy_time) < wait:
+                print(f"ℹ️ Waiting backoff before deploy: {int(wait - (now - last_redeploy_time))}s left")
+                continue
+            print("⚠️ Idle 30+ min, attempting redeploy (Render API preferred)")
+            # Prefer Render API if keys present, fallback to hook
+            triggered = False
+            if RENDER_API_KEY and RENDER_SERVICE_ID:
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    triggered = loop.run_until_complete(trigger_render_deploy_async())
+                    loop.close()
+                except Exception as e:
+                    print(f"⚠️ Async render deploy error: {e}")
+            if not triggered and RENDER_DEPLOY_HOOK:
+                triggered = redeploy_via_hook()
+            if triggered:
+                redeploy_count_today += 1
+                last_redeploy_time = time.time()
+
+# ---------------- Keep-alive ping loop ---------------- #
+def keep_alive():
+    while True:
+        time.sleep(300)  # every 5 minutes
         try:
-            requests.get("http://127.0.0.1:10000/ping", timeout=5)
+            requests.get(f"http://127.0.0.1:{PORT}/ping", timeout=5)
             print("✅ Internal ping successful")
         except Exception as e:
             print(f"⚠️ Internal ping failed: {e}")
-        
-        # Ping external Render URL to prevent sleep
         if EXTERNAL_URL:
             try:
-                response = requests.get(f"{EXTERNAL_URL}/ping", timeout=10)
-                print(f"✅ External ping successful: {response.status_code}")
+                r = requests.get(f"{EXTERNAL_URL}/ping", timeout=10)
+                print(f"✅ External ping successful: {r.status_code}")
             except Exception as e:
                 print(f"⚠️ External ping failed: {e}")
         else:
             print("ℹ️ No EXTERNAL_URL set, skipping external ping")
 
-def monitor_health():
-    global last_msg_time
-    while True:
-        time.sleep(300)
-        if (time.time() - last_msg_time) > 1800:
-            print("⚠️ Idle 30+ min, redeploying")
-            redeploy()
-
-def start_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot_main())
-
 # ---------------- Flask endpoints ---------------- #
 @app.route("/")
 def home():
     return jsonify({
-        "status": "running", 
-        "telegram_primary": CHANNEL_ID, 
+        "status": "running",
+        "telegram_primary": CHANNEL_ID,
         "telegram_secondary": CHANNEL_ID_2,
         "channel_1_enabled": USE_CHANNEL_1,
         "channel_2_enabled": USE_CHANNEL_2,
         "channel_1_sources": len(SOURCE_IDS_CHANNEL_1),
-        "channel_2_sources": len(SOURCE_IDS_CHANNEL_2)
+        "channel_2_sources": len(SOURCE_IDS_CHANNEL_2),
     })
 
 @app.route("/ping")
@@ -504,24 +542,36 @@ def health():
 @app.route("/stats")
 def stats():
     return jsonify({
-        "unique_links": len(seen_urls), 
+        "unique_links": len(seen_urls),
         "last_message_time": last_msg_time,
         "telegram_channels": [CHANNEL_ID, CHANNEL_ID_2] if CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0 else [CHANNEL_ID],
         "channel_1_enabled": USE_CHANNEL_1,
         "channel_2_enabled": USE_CHANNEL_2,
-        "channel_1_sources_count": len(SOURCE_IDS_CHANNEL_1),
-        "channel_2_sources_count": len(SOURCE_IDS_CHANNEL_2)
     })
 
 @app.route("/redeploy", methods=["POST"])
 def redeploy_endpoint():
-    return ("ok", 200) if redeploy() else ("fail", 500)
+    # safe synchronous redeploy that uses Render API if configured
+    triggered = False
+    if RENDER_API_KEY and RENDER_SERVICE_ID:
+        try:
+            # run async trigger
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            triggered = loop.run_until_complete(trigger_render_deploy_async())
+            loop.close()
+        except Exception as e:
+            print(f"⚠️ Redeploy async error: {e}")
+    if not triggered and RENDER_DEPLOY_HOOK:
+        triggered = redeploy_via_hook()
+    return ("ok", 200) if triggered else ("fail", 500)
 
 # ---------------- Entrypoint ---------------- #
 if __name__ == "__main__":
+    # start bot
     loop = asyncio.new_event_loop()
-    Thread(target=start_loop, args=(loop,), daemon=True).start()
+    Thread(target=lambda: asyncio.set_event_loop(loop) or loop.run_until_complete(bot_main()), daemon=True).start()
     Thread(target=keep_alive, daemon=True).start()
     Thread(target=monitor_health, daemon=True).start()
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", PORT))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
