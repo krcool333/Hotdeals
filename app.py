@@ -1,7 +1,7 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
 # Preserves your per-channel source routing and in-memory dedupe.
-# Adds: media mode (separate/caption/embedded), single-affiliate-tag enforcement, FORCE_MEDIA toggle.
-# CHANGE MARKERS: see "### CHANGE 1/2/3" comments below.
+# Adds: media mode (separate/caption/embedded), single-affiliate-tag enforcement, FORCE_MEDIA toggle,
+# and NIGHT PAUSE (2:00-06:00 by env NIGHT_START_HOUR / NIGHT_END_HOUR).
 
 import os
 import re
@@ -16,6 +16,7 @@ from threading import Thread
 from flask import Flask, jsonify, request
 import aiohttp
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import datetime
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -73,6 +74,50 @@ REDEPLOY_BACKOFF_BASE = int(os.getenv("REDEPLOY_BACKOFF_BASE", "60"))
 MEDIA_MODE = os.getenv("MEDIA_MODE", "separate").lower()  # default 'separate'
 # CHANGE 3: FORCE_MEDIA toggle env
 FORCE_MEDIA = os.getenv("FORCE_MEDIA", "true").lower() == "true"
+
+# ---------------- NIGHT PAUSE (ADDED) ----------------
+# Uses NIGHT_PAUSE_ENABLED, NIGHT_START_HOUR, NIGHT_END_HOUR, NIGHT_TIMEZONE
+NIGHT_PAUSE_ENABLED = os.getenv("NIGHT_PAUSE_ENABLED", "false").lower() == "true"
+NIGHT_START_HOUR = int(os.getenv("NIGHT_START_HOUR", "2"))
+NIGHT_END_HOUR = int(os.getenv("NIGHT_END_HOUR", "6"))
+NIGHT_TIMEZONE = os.getenv("NIGHT_TIMEZONE", "Asia/Kolkata")
+
+# Try timezone libraries: pytz preferred, then zoneinfo (py3.9+), else fallback to server local time.
+try:
+    import pytz
+    TZ_LIB = "pytz"
+except Exception:
+    try:
+        from zoneinfo import ZoneInfo  # Python 3.9+
+        TZ_LIB = "zoneinfo"
+    except Exception:
+        TZ_LIB = None
+
+def is_night_pause_now():
+    """Return True if night pause is enabled and current hour (in NIGHT_TIMEZONE) falls inside window."""
+    if not NIGHT_PAUSE_ENABLED:
+        return False
+    try:
+        if TZ_LIB == "pytz":
+            tz = pytz.timezone(NIGHT_TIMEZONE)
+            now = datetime.datetime.now(tz)
+        elif TZ_LIB == "zoneinfo":
+            tz = ZoneInfo(NIGHT_TIMEZONE)
+            now = datetime.datetime.now(tz)
+        else:
+            # Fallback - server local time (less reliable). Use warning in logs.
+            now = datetime.datetime.now()
+        hour = now.hour
+        start = NIGHT_START_HOUR % 24
+        end = NIGHT_END_HOUR % 24
+        if start < end:
+            return start <= hour < end
+        else:
+            # wrap-around (e.g., 22 -> 06)
+            return hour >= start or hour < end
+    except Exception as e:
+        print(f"⚠️ Night pause check failed: {e}")
+        return False
 
 # ---------------- DIFFERENT SOURCES ---------------- #
 SOURCE_IDS_CHANNEL_1 = [
@@ -353,22 +398,17 @@ def build_embedded_image(text_top: str, product_bytes: bytes, max_width: int = 9
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow not installed for embedded mode")
     try:
-        # open product image
         prod_im = Image.open(io.BytesIO(product_bytes)).convert("RGBA")
-        # scale product image to max width
         if prod_im.width > max_width:
             ratio = max_width / prod_im.width
             prod_im = prod_im.resize((max_width, int(prod_im.height * ratio)), Image.LANCZOS)
 
-        # prepare text area
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
         except Exception:
             font = ImageFont.load_default()
 
-        # wrap the text to fit width
         draw_temp = ImageDraw.Draw(prod_im)
-        # we need width of the final image - using prod_im.width
         wrap_width = prod_im.width - 20
         words = text_top.split()
         lines = []
@@ -383,16 +423,13 @@ def build_embedded_image(text_top: str, product_bytes: bytes, max_width: int = 9
             lines.append(line)
         text_height = sum(draw_temp.textsize(l, font=font)[1] + 6 for l in lines) + 16
 
-        # create final canvas (text area above product)
         final_h = text_height + prod_im.height + 20
         final_im = Image.new("RGBA", (prod_im.width + 20, final_h), (255, 255, 255, 255))
         draw = ImageDraw.Draw(final_im)
-        # draw text
         y = 8
         for ln in lines:
             draw.text((10, y), ln, font=font, fill=(0, 0, 0))
             y += draw.textsize(ln, font=font)[1] + 6
-        # paste product image
         final_im.paste(prod_im, (10, text_height + 8), prod_im if prod_im.mode == "RGBA" else None)
 
         out = io.BytesIO()
@@ -442,7 +479,6 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
 
         # Mode: separate -> text then image (keeps link clickable)
         if mode == "separate":
-            # Send text first (no preview to avoid duplicate large preview)
             try:
                 await client.send_message(channel_id, message, link_preview=False)
                 print(f"✅ Sent text to {channel_name} ({channel_id}) (separate mode)")
@@ -454,9 +490,7 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
                     except Exception:
                         pass
                 return False
-            # short delay to ensure ordering
             await asyncio.sleep(0.7)
-            # send image separately
             try:
                 bio = io.BytesIO(image_bytes)
                 bio.name = "deal.png"
@@ -475,15 +509,14 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
         elif mode == "caption":
             try:
                 promo = image_bytes
-                # optional overlay (keep original image if overlay fails)
                 if PIL_AVAILABLE:
                     try:
-                        promo = build_embedded_image("", image_bytes)  # using empty text overlay
+                        # small optional overlay: use embedded composer with empty top text to standardize size if wanted
+                        promo = image_bytes
                     except Exception:
                         promo = image_bytes
                 bio = io.BytesIO(promo)
                 bio.name = "deal.png"
-                # send image with caption (caption will appear below image)
                 await client.send_file(channel_id, file=bio, caption=message, link_preview=False)
                 print(f"✅ Sent image+caption to {channel_name} ({channel_id}) (caption mode)")
                 return True
@@ -499,12 +532,10 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
         # Mode: embedded -> compose image with text on top (single message, link not clickable)
         elif mode == "embedded":
             try:
-                # Compose image with text on top
                 try:
                     final_bytes = build_embedded_image(message, image_bytes)
                 except Exception as e_embed:
                     print(f"⚠️ Embedded compose failed: {e_embed} (falling back to caption mode)")
-                    # fallback to caption
                     final_bytes = image_bytes
                 bio = io.BytesIO(final_bytes)
                 bio.name = "deal.png"
@@ -534,6 +565,11 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
 
 # ---------------- Updated process_and_send accepts optional msg_obj ----------------
 async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg_obj=None):
+    # --- NIGHT PAUSE CHECK (NEW) ---
+    if is_night_pause_now():
+        print(f"⏸️ Night pause active ({NIGHT_START_HOUR}:00-{NIGHT_END_HOUR}:00 {NIGHT_TIMEZONE}) - skipping message")
+        return False
+
     if not raw_txt and not getattr(msg_obj, "media", None):
         return False
 
