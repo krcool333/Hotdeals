@@ -1,10 +1,11 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
 # Preserves your per-channel source routing and in-memory dedupe.
-# Adds: aiohttp EarnKaro, rate-limiter, Render API deploy helper, safer monitor.
+# Adds media/image reposting (Telegram media or OG-image fallback) with minimal changes only.
 
 import os
 import re
 import time
+import io
 import hashlib
 import random
 import asyncio
@@ -17,6 +18,13 @@ import aiohttp
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
+
+# Optional Pillow for overlays; NOT required.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 # ---------------- Load env ---------------- #
 dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -254,34 +262,173 @@ def truncate_message(msg):
 def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
-async def send_to_specific_channel(message, channel_id, channel_name):
+# ---------------- New: Image helpers (minimal, safe) ----------------
+async def get_og_image_from_page(url: str, timeout_sec: int = 6):
+    """Try to extract OG-image or first img src from page (async)."""
     try:
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, timeout=timeout) as r:
+                if r.status != 200:
+                    return None
+                text = await r.text()
+                m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', text, flags=re.I)
+                if m:
+                    return m.group(1)
+                m2 = re.search(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', text, flags=re.I)
+                if m2:
+                    return m2.group(1)
+                m3 = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', text, flags=re.I)
+                if m3:
+                    return m3.group(1)
+    except Exception:
+        return None
+    return None
+
+async def fetch_image_bytes(url: str, timeout_sec: int = 8):
+    """Fetch image bytes via aiohttp (async)."""
+    if not url:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, timeout=timeout) as r:
+                if r.status == 200:
+                    data = await r.read()
+                    if data and len(data) > 1000:
+                        return data
+    except Exception:
+        return None
+    return None
+
+async def extract_image_from_msg_obj(msg_obj):
+    """
+    1) If msg_obj has Telegram media, download it.
+    2) Else, try OG-image from first URL in message text.
+    Returns bytes or None.
+    """
+    try:
+        if getattr(msg_obj, "media", None):
+            b = io.BytesIO()
+            try:
+                await client.download_media(msg_obj.media, file=b)
+                b.seek(0)
+                data = b.read()
+                if data and len(data) > 1000:
+                    return data
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # fallback: detect first URL and scrape OG image
+    try:
+        text = msg_obj.message or ""
+        urls = re.findall(r"(https?://\S+)", text)
+        for u in urls:
+            if any(k in u for k in ["amazon", "flipkart", "myntra", "ajio", "fkrt", "bit.ly", "amzn.to"]):
+                img_url = await get_og_image_from_page(u)
+                if img_url:
+                    if img_url.startswith("//"):
+                        img_url = "https:" + img_url
+                    img_bytes = await fetch_image_bytes(img_url)
+                    if img_bytes:
+                        return img_bytes
+    except Exception:
+        pass
+
+    return None
+
+def build_promotional_image(product_bytes: bytes, badge_text: str = "🔥 Deal", price_text: str = None):
+    """
+    Optional: overlay badge and price using Pillow if available.
+    If Pillow not installed, returns original bytes unchanged.
+    """
+    if not PIL_AVAILABLE:
+        return product_bytes
+    try:
+        im = Image.open(io.BytesIO(product_bytes)).convert("RGBA")
+        max_width = 900
+        if im.width > max_width:
+            ratio = max_width / im.width
+            im = im.resize((max_width, int(im.height * ratio)), Image.LANCZOS)
+        draw = ImageDraw.Draw(im)
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.rectangle([(10, 10), (240, 10 + 40)], fill=(255, 69, 0, 220))
+        draw.text((18, 14), badge_text, font=font, fill="white")
+        if price_text:
+            h = im.height
+            draw.rectangle([(0, h - 44), (im.width, h)], fill=(0, 0, 0, 200))
+            draw.text((12, h - 36), price_text, font=font, fill="white")
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        out.seek(0)
+        return out.read()
+    except Exception:
+        return product_bytes
+
+# ---------------- Updated: send_to_specific_channel now supports optional msg_obj to repost media ----------------
+async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=None):
+    """
+    If msg_obj provided and contains image (Telegram media or OG), the bot will attempt to send image+caption.
+    Falls back to send_message when no media or if send_file fails.
+    """
+    try:
+        # Try image extraction only if msg_obj is provided
+        if msg_obj is not None:
+            try:
+                image_bytes = await extract_image_from_msg_obj(msg_obj)
+                if image_bytes:
+                    # optional overlay
+                    promo = build_promotional_image(image_bytes, badge_text="🔥 Deal")
+                    bio = io.BytesIO(promo)
+                    bio.name = "deal.png"
+                    await client.send_file(channel_id, file=bio, caption=message, link_preview=False)
+                    print(f"✅ Sent image+caption to {channel_name} ({channel_id})")
+                    return True
+            except Exception as e:
+                # if media send fails, fall back to text send and notify admin once
+                print(f"⚠️ Image send failed, falling back to text for {channel_name}: {e}")
+                try:
+                    await notify_admin(f"⚠️ Image send failed for {channel_name}: {e}")
+                except Exception:
+                    pass
+
+        # Default: send text message
         await client.send_message(channel_id, message, link_preview=False)
         print(f"✅ Sent to {channel_name} ({channel_id})")
         return True
     except Exception as ex:
         print(f"❌ Telegram error for {channel_name} ({channel_id}): {ex}")
         if "two different IP addresses" not in str(ex):
-            await notify_admin(f"❌ {channel_name} error ({channel_id}): {ex}")
+            try:
+                await notify_admin(f"❌ {channel_name} error ({channel_id}): {ex}")
+            except Exception:
+                pass
         return False
 
-async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
-    if not raw_txt:
+# ---------------- Updated: process_and_send accepts optional msg_obj to allow media repost ----------------
+async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg_obj=None):
+    if not raw_txt and not getattr(msg_obj, "media", None):
         return False
 
-    print(f"📨 [{channel_name}] Raw message: {raw_txt[:120]}...")
+    print(f"📨 [{channel_name}] Raw message: {(raw_txt or '')[:120]}...")
 
-    urls_in_raw = re.findall(r"https?://\S+", raw_txt)
-    if len(raw_txt.strip()) < 20 and not urls_in_raw:
-        print(f"⚠️ [{channel_name}] Skipped: Message too short and no URLs")
+    urls_in_raw = re.findall(r"https?://\S+", raw_txt or "")
+    if (not raw_txt or len(raw_txt.strip()) < 20) and not urls_in_raw and not getattr(msg_obj, "media", None):
+        print(f"⚠️ [{channel_name}] Skipped: Message too short and no URLs and no media")
         return False
 
     try:
-        processed = await process(raw_txt)
+        processed = await process(raw_txt or "")
         urls = re.findall(r"https?://\S+", processed)
 
-        if not urls:
-            print(f"⚠️ [{channel_name}] Skipped: No valid URLs found after processing")
+        # If no URLs and no media, skip
+        if not urls and not getattr(msg_obj, "media", None):
+            print(f"⚠️ [{channel_name}] Skipped: No valid URLs found after processing and no media")
             return False
 
         now = time.time()
@@ -348,7 +495,8 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict):
         # small jitter before sending (stagger across channels)
         await asyncio.sleep(random.uniform(0.5, 2.5))
 
-        success = await send_to_specific_channel(msg, target_channel, channel_name)
+        # Pass msg_obj so send function can attempt media repost
+        success = await send_to_specific_channel(msg, target_channel, channel_name, msg_obj=msg_obj)
 
         if success:
             global last_msg_time
@@ -417,13 +565,14 @@ async def bot_main():
     if USE_CHANNEL_1 and sources_channel_1:
         @client.on(events.NewMessage(chats=sources_channel_1))
         async def handler_channel_1(e):
-            await process_and_send(e.message.message or "", CHANNEL_ID, "Channel 1", seen_channel_1)
+            # pass full message object so media helper can extract images
+            await process_and_send(e.message.message or "", CHANNEL_ID, "Channel 1", seen_channel_1, msg_obj=e.message)
 
     # Handler for Channel 2 sources
     if USE_CHANNEL_2 and sources_channel_2:
         @client.on(events.NewMessage(chats=sources_channel_2))
         async def handler_channel_2(e):
-            await process_and_send(e.message.message or "", int(CHANNEL_ID_2), "Channel 2", seen_channel_2)
+            await process_and_send(e.message.message or "", int(CHANNEL_ID_2), "Channel 2", seen_channel_2, msg_obj=e.message)
 
     print("🔄 Bot is now actively monitoring different sources for each channel...")
     await client.run_until_disconnected()
