@@ -1,7 +1,6 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
 # Preserves your per-channel source routing and in-memory dedupe.
 # Adds improved Amazon canonicalization + "More (full list)" + caption truncation & admin cooldown.
-
 import os
 import re
 import time
@@ -21,7 +20,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
-# Optional Pillow for overlays; NOT required.
+# Optional Pillow for overlays; NOT required (we will NOT use overlay in send flow)
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -37,8 +36,8 @@ API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0") or 0)
+CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0") or 0)
 
 # Channel control
 USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
@@ -63,6 +62,10 @@ EXTERNAL_URL = os.getenv("EXTERNAL_URL", "").strip()
 
 # Rate limiting & backoff
 MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))  # default 60s
+# Per-channel overrides (optional)
+MIN_INTERVAL_SECONDS_CHANNEL_1 = int(os.getenv("MIN_INTERVAL_SECONDS_CHANNEL_1", str(MIN_INTERVAL_SECONDS)))
+MIN_INTERVAL_SECONDS_CHANNEL_2 = int(os.getenv("MIN_INTERVAL_SECONDS_CHANNEL_2", str(MIN_INTERVAL_SECONDS)))
+
 MIN_JITTER = int(os.getenv("MIN_JITTER", "3"))
 MAX_JITTER = int(os.getenv("MAX_JITTER", "12"))
 MAX_REDEPLOYS_PER_DAY = int(os.getenv("MAX_REDEPLOYS_PER_DAY", "3"))
@@ -115,8 +118,8 @@ redeploy_count_today = 0
 last_redeploy_time = 0
 
 # admin notification cooldowns to avoid spamming owner
-_admin_notify_cache = {}  # error_key -> timestamp
-_ADMIN_NOTIFY_COOLDOWN = 600  # seconds (10 minutes): won't resend same error to admin within this
+_admin_notify_cache = {}  # normalized_hash -> timestamp
+_ADMIN_NOTIFY_COOLDOWN = int(os.getenv("ADMIN_NOTIFY_COOLDOWN", "600"))  # default 10 minutes
 
 # ---------------- Session handling ---------------- #
 if STRING_SESSION:
@@ -141,17 +144,23 @@ atexit.register(cleanup)
 
 # ---------------- Helpers ---------------- #
 async def notify_admin(message, error_key=None):
-    """Send notification to admin (via user session) with simple cooldown per error_key."""
+    """Send notification to admin (via user session) with cooldown.
+    error_key is normalized by hashing so similar messages collapse to same cooldown bucket.
+    """
     if not ADMIN_NOTIFY:
         return
     now = time.time()
-    # if error_key provided, use cooldown
     if error_key:
-        last = _admin_notify_cache.get(error_key, 0)
+        # normalize error_key to a fixed-size hash to avoid near-unique keys
+        try:
+            key_norm = hashlib.sha1(error_key.encode('utf-8')).hexdigest()[:24]
+        except Exception:
+            key_norm = str(error_key)[:24]
+        last = _admin_notify_cache.get(key_norm, 0)
         if (now - last) < _ADMIN_NOTIFY_COOLDOWN:
-            print("ℹ️ Admin notify suppressed by cooldown for key:", error_key)
+            print("ℹ️ Admin notify suppressed by cooldown for key:", key_norm)
             return
-        _admin_notify_cache[error_key] = now
+        _admin_notify_cache[key_norm] = now
     try:
         target = ADMIN_NOTIFY[1:] if ADMIN_NOTIFY.startswith("@") else ADMIN_NOTIFY
         await client.send_message(target, message)
@@ -160,16 +169,37 @@ async def notify_admin(message, error_key=None):
         print(f"⚠️ Admin notify failed: {e}")
 
 async def expand_all(text):
-    """Expand short URLs like fkrt.cc, amzn.to etc (async)."""
-    urls = sum((re.findall(p, text) for p in SHORT_PATTERNS), [])
+    """Expand short URLs like fkrt.cc, amzn.to etc (async).
+    - Try HEAD first; if blocked (405) or fails, try GET.
+    - Strip trailing punctuation from matched short URL.
+    """
+    # find matches for all short patterns (strip trailing punctuation)
+    found = []
+    for p in SHORT_PATTERNS:
+        for m in re.findall(p, text):
+            u = m.rstrip(').,;:]}')
+            found.append(u)
+    urls = list(dict.fromkeys(found))
     if not urls:
         return text
-    timeout = aiohttp.ClientTimeout(total=5)
+    timeout = aiohttp.ClientTimeout(total=7)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         for u in urls:
             try:
-                async with s.head(u, allow_redirects=True) as r:
-                    expanded_url = str(r.url)
+                expanded_url = None
+                try:
+                    async with s.head(u, allow_redirects=True) as r:
+                        expanded_url = str(r.url)
+                except Exception:
+                    # HEAD failed for this shortener; try GET
+                    try:
+                        async with s.get(u, allow_redirects=True) as r2:
+                            expanded_url = str(r2.url)
+                    except Exception as e2:
+                        print(f"⚠️ GET expansion failed for {u}: {e2}")
+                        expanded_url = None
+                if expanded_url and expanded_url != u:
+                    # replace occurrences of the short url in the original text
                     text = text.replace(u, expanded_url)
                     print(f"🔗 Expanded {u} → {expanded_url}")
             except Exception as e:
@@ -380,7 +410,7 @@ def truncate_message(msg):
 def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
-# ---------------- New: Image helpers (unchanged) ----------------
+# ---------------- Image helpers (we send original bytes; overlay not used) ----------------
 async def get_og_image_from_page(url: str, timeout_sec: int = 6):
     """Try to extract OG-image or first img src from page (async)."""
     try:
@@ -457,6 +487,7 @@ async def extract_image_from_msg_obj(msg_obj):
 
     return None
 
+# keep build_promotional_image function for compatibility but we will NOT call it.
 def build_promotional_image(product_bytes: bytes, badge_text: str = "🔥 Deal", price_text: str = None):
     """
     Optional: overlay badge and price using Pillow if available.
@@ -505,13 +536,12 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
             try:
                 image_bytes = await extract_image_from_msg_obj(msg_obj)
                 if image_bytes:
-                    # create promotional image (overlay) if Pillow available
-                    promo = build_promotional_image(image_bytes, badge_text="🔥 Deal")
-                    bio = io.BytesIO(promo)
+                    # send original image bytes without overlay (no Pillow processing)
+                    bio = io.BytesIO(image_bytes)
                     bio.name = "deal.png"
 
                     # ensure caption length within safe limits for send_file
-                    CAPTION_SAFE_LIMIT = 900  # safe margin (Telegram's limit ~1024)
+                    CAPTION_SAFE_LIMIT = 800  # safe margin (Telegram's limit ~1024)
                     caption = message
                     if len(caption) > CAPTION_SAFE_LIMIT:
                         # truncate caption but keep a link to full in follow-up text
@@ -600,7 +630,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
                     dedupe_keys.append(c)
                     print(f"🔗 [{channel_name}] URL dedupe key: {c}")
                 else:
-                    print(f"⚠️ [{channel_name}] Duplicate URL skipped: {c}")
+                    print(f"⚠️ [{channel_name}] Duplicate URL skipped (seen {int(now - last_seen)}s ago): {c}")
 
         # dedupe by text hash
         text_key = hash_text(processed)
@@ -609,7 +639,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
             dedupe_keys.append(text_key)
             print(f"📝 [{channel_name}] Text dedupe key: {text_key}")
         else:
-            print(f"⚠️ [{channel_name}] Duplicate text skipped: {text_key}")
+            print(f"⚠️ [{channel_name}] Duplicate text skipped (seen {int(now - last_seen)}s ago): {text_key}")
 
         # Only skip if BOTH URL and text are duplicates
         if not dedupe_keys:
@@ -644,7 +674,14 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         # --- RATE LIMIT PER CHANNEL (avoid bursts / spam flags) ---
         now_ts = time.time()
         last = last_sent_channel.get(channel_name, 0)
-        need_wait = MIN_INTERVAL_SECONDS + random.randint(MIN_JITTER, MAX_JITTER)
+        # choose base interval per channel
+        if channel_name.lower().startswith("channel 1"):
+            base_interval = MIN_INTERVAL_SECONDS_CHANNEL_1
+        elif channel_name.lower().startswith("channel 2"):
+            base_interval = MIN_INTERVAL_SECONDS_CHANNEL_2
+        else:
+            base_interval = MIN_INTERVAL_SECONDS
+        need_wait = base_interval + random.randint(MIN_JITTER, MAX_JITTER)
         if (now_ts - last) < need_wait:
             print(f"⏱️ Rate limit: skip {channel_name}. Need {int(need_wait - (now_ts - last))}s more.")
             return False
