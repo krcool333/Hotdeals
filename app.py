@@ -71,6 +71,20 @@ MAX_JITTER = int(os.getenv("MAX_JITTER", "12"))
 MAX_REDEPLOYS_PER_DAY = int(os.getenv("MAX_REDEPLOYS_PER_DAY", "3"))
 REDEPLOY_BACKOFF_BASE = int(os.getenv("REDEPLOY_BACKOFF_BASE", "60"))
 
+# Night pause configuration
+NIGHT_PAUSE_ENABLED = os.getenv("NIGHT_PAUSE_ENABLED", "false").lower() == "true"
+try:
+    NIGHT_START_HOUR = int(os.getenv("NIGHT_START_HOUR", "2"))
+    NIGHT_END_HOUR = int(os.getenv("NIGHT_END_HOUR", "6"))
+except Exception:
+    NIGHT_START_HOUR = 2
+    NIGHT_END_HOUR = 6
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Calcutta")
+
+# Admin notify cooldown (seconds)
+_admin_notify_cache = {}
+_ADMIN_NOTIFY_COOLDOWN = int(os.getenv("ADMIN_NOTIFY_COOLDOWN", "600"))  # default 10 minutes
+
 # ---------------- DIFFERENT SOURCES ---------------- #
 SOURCE_IDS_CHANNEL_1 = [
     -1001448358487,  # Yaha Everything
@@ -116,10 +130,6 @@ last_msg_time = time.time()
 last_sent_channel = {}   # channel_name -> timestamp
 redeploy_count_today = 0
 last_redeploy_time = 0
-
-# admin notification cooldowns to avoid spamming owner
-_admin_notify_cache = {}  # normalized_hash -> timestamp
-_ADMIN_NOTIFY_COOLDOWN = int(os.getenv("ADMIN_NOTIFY_COOLDOWN", "600"))  # default 10 minutes
 
 # ---------------- Session handling ---------------- #
 if STRING_SESSION:
@@ -519,6 +529,29 @@ def build_promotional_image(product_bytes: bytes, badge_text: str = "🔥 Deal",
     except Exception:
         return product_bytes
 
+# ---------------- Night pause helper ----------------
+def is_night_pause():
+    """Return True if current local hour (in TIMEZONE) falls inside the pause window."""
+    try:
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(TIMEZONE)
+            now = datetime.now(tz)
+        except Exception:
+            # fallback to system localtime if ZoneInfo not available
+            now = datetime.now()
+        hour = now.hour
+        # handle wrap-around (e.g., start=22, end=6)
+        if NIGHT_START_HOUR <= NIGHT_END_HOUR:
+            return NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
+        else:
+            # pause wraps across midnight
+            return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
+    except Exception as e:
+        print("⚠️ is_night_pause check failed:", e)
+        return False
+
 # ---------------- Updated: send_to_specific_channel now truncates caption & reduces admin spam ----------------
 def _extract_first_url(text):
     r = re.search(r'(https?://\S+)', text)
@@ -600,6 +633,11 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
 # ---------------- Updated: process_and_send (keeps all behavior, adds msg_obj pass) ----------------
 async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg_obj=None):
     if not raw_txt and not getattr(msg_obj, "media", None):
+        return False
+
+    # night pause: skip processing during configured quiet hours
+    if NIGHT_PAUSE_ENABLED and is_night_pause():
+        print(f"🌙 Night pause active ({NIGHT_START_HOUR}:00 - {NIGHT_END_HOUR}:00 {TIMEZONE}). Skipping {channel_name}.")
         return False
 
     print(f"📨 [{channel_name}] Raw message: {(raw_txt or '')[:120]}...")
