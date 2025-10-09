@@ -1,6 +1,6 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
 # Preserves your per-channel source routing and in-memory dedupe.
-# Adds media/image reposting (Telegram media or OG-image fallback) with minimal changes only.
+# Adds improved Amazon canonicalization + "More (full list)" + caption truncation & admin cooldown.
 
 import os
 import re
@@ -14,6 +14,8 @@ import requests
 from threading import Thread
 from flask import Flask, jsonify, request
 import aiohttp
+from collections import Counter
+from urllib.parse import urlparse, parse_qs, unquote
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -93,9 +95,13 @@ SHORT_PATTERNS = [
 
 HASHTAG_SETS = [
     "#LootDeals #Discount #OnlineShopping",
-    "#Free #Offer #Sale",
+    "#FAST #Offer #Sale",
     "#TopDeals #BigSale #BestPrice",
     "#PriceDrop #FlashSale #DealAlert",
+    "#Amazondeals #Promo #Shoppingree",
+    "#ShopSmart #SaleAlert #clusiveDeal",
+    "#TrendingOffers #SaveMoreHotOffer",
+    "#DesiDeals #BestBuy #Discount",
 ]
 
 # ---------------- Runtime in-memory state (no Redis) ---------------- #
@@ -107,6 +113,10 @@ last_msg_time = time.time()
 last_sent_channel = {}   # channel_name -> timestamp
 redeploy_count_today = 0
 last_redeploy_time = 0
+
+# admin notification cooldowns to avoid spamming owner
+_admin_notify_cache = {}  # error_key -> timestamp
+_ADMIN_NOTIFY_COOLDOWN = 600  # seconds (10 minutes): won't resend same error to admin within this
 
 # ---------------- Session handling ---------------- #
 if STRING_SESSION:
@@ -130,10 +140,18 @@ def cleanup():
 atexit.register(cleanup)
 
 # ---------------- Helpers ---------------- #
-async def notify_admin(message):
-    """Send notification to admin (via user session)."""
+async def notify_admin(message, error_key=None):
+    """Send notification to admin (via user session) with simple cooldown per error_key."""
     if not ADMIN_NOTIFY:
         return
+    now = time.time()
+    # if error_key provided, use cooldown
+    if error_key:
+        last = _admin_notify_cache.get(error_key, 0)
+        if (now - last) < _ADMIN_NOTIFY_COOLDOWN:
+            print("ℹ️ Admin notify suppressed by cooldown for key:", error_key)
+            return
+        _admin_notify_cache[error_key] = now
     try:
         target = ADMIN_NOTIFY[1:] if ADMIN_NOTIFY.startswith("@") else ADMIN_NOTIFY
         await client.send_message(target, message)
@@ -158,22 +176,121 @@ async def expand_all(text):
                 print(f"⚠️ Expansion failed for {u}: {e}")
     return text
 
-def convert_amazon(text):
-    """Force Amazon affiliate tag (replace existing tag or add ours)."""
-    # Replace existing tag parameters
-    text = re.sub(r'([?&])tag=[^&\s&]+', r'\1tag=' + AFFILIATE_TAG, text)
-    # Handle Amazon product links without tags
-    pat = r'(https?://(?:www\.)?amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10}))'
-    def repl(m):
-        asin = m.group(2)
-        url = m.group(1)
-        if '?' in url:
-            return f"{url}&tag={AFFILIATE_TAG}"
-        else:
-            return f"https://www.amazon.in/dp/{asin}/?tag={AFFILIATE_TAG}"
-    text = re.sub(pat, repl, text, flags=re.I)
-    return text
+# ---------------- Improved Amazon link canonicalizer ---------------- #
+def _find_asins_in_string(s):
+    """Return list of all 10-char alnum sequences that look like ASINs (uppercased)."""
+    tokens = re.findall(r'([A-Z0-9]{10})', s, flags=re.I)
+    return [t.upper() for t in tokens]
 
+def _first_asin_from_qs(qs):
+    for k in ("asin", "ASIN"):
+        if k in qs and qs[k]:
+            val = qs[k][0]
+            if re.match(r'^[A-Z0-9]{10}$', val, flags=re.I):
+                return val.upper()
+    # look for asinlist/asins-like keys
+    for k, v in qs.items():
+        if "asin" in k.lower() and v:
+            first = re.split(r'[|,]', v[0])[0]
+            if re.match(r'^[A-Z0-9]{10}$', first, flags=re.I):
+                return first.upper()
+    return None
+
+def convert_amazon(text):
+    """
+    Replace long amazon/store URLs with short affiliate product links:
+    - Extract ASINs from many patterns.
+    - If multiple ASINs exist, choose the most frequent ASIN (better selection).
+    - Insert short link: https://www.amazon.in/dp/<ASIN>/?tag=<AFFILIATE_TAG>
+    - If the original URL contained many ASINs or was very long, append:
+        "\n👉 More (full list): <original_url>"
+    """
+    if not text:
+        return text
+
+    # First replace existing tag=... occurrences globally to our tag
+    try:
+        text = re.sub(r'([?&])tag=[^&\s&]+', r'\1tag=' + AFFILIATE_TAG, text)
+    except Exception:
+        pass
+
+    # Find amazon-like URLs
+    urls = re.findall(r'https?://[^\s)]+amazon\.[a-z\.]{2,6}[^\s)\]\}]*', text, flags=re.I)
+    if not urls:
+        return text
+
+    new_text = text
+    for u in sorted(set(urls), key=lambda x: -len(x)):  # longer first to avoid partial matches
+        orig_u = u
+        try:
+            # decode double-encoded artifacts
+            try:
+                u_dec = unquote(unquote(u))
+            except Exception:
+                try:
+                    u_dec = unquote(u)
+                except Exception:
+                    u_dec = u
+
+            # Collect ASIN candidates
+            asins = []
+
+            # pattern /dp/ASIN or /gp/product/ASIN
+            m = re.findall(r'/dp/([A-Z0-9]{10})', u_dec, flags=re.I)
+            if m:
+                asins.extend([x.upper() for x in m])
+            m2 = re.findall(r'/gp/(?:product|aw/d)/([A-Z0-9]{10})', u_dec, flags=re.I)
+            if m2:
+                asins.extend([x.upper() for x in m2])
+
+            # query string asin or asin list
+            try:
+                qs = parse_qs(urlparse(u_dec).query)
+                q_asin = _first_asin_from_qs(qs)
+                if q_asin:
+                    asins.append(q_asin)
+            except Exception:
+                pass
+
+            # fallback: any 10-char tokens
+            fallback = _find_asins_in_string(u_dec)
+            if fallback:
+                asins.extend(fallback)
+
+            # sanitize order
+            if asins:
+                # choose most common ASIN if multiple present
+                count = Counter(asins)
+                chosen = count.most_common(1)[0][0]
+                short = f"https://www.amazon.in/dp/{chosen}/?tag={AFFILIATE_TAG}"
+
+                # Detect multi-ASIN / store preview scenarios:
+                many_asins = len(set(asins)) >= 3
+                long_url = len(orig_u) > 180
+                store_preview = bool(re.search(r'(store|preview|asinlist|asins|isPreview|isSlp)', orig_u, flags=re.I))
+
+                if many_asins or long_url or store_preview:
+                    replacement = f"{short}\n👉 More (full list): {orig_u}"
+                else:
+                    replacement = short
+
+                new_text = new_text.replace(orig_u, replacement)
+                print(f"🔁 Amazon converted: {orig_u[:80]} -> {replacement}")
+            else:
+                # no ASIN found: ensure tag param present (append if missing)
+                replaced = re.sub(r'([?&])tag=[^&\s]+', r'\1tag=' + AFFILIATE_TAG, orig_u)
+                if 'tag=' not in replaced:
+                    if '?' in replaced:
+                        replaced = replaced + "&tag=" + AFFILIATE_TAG
+                    else:
+                        replaced = replaced + "?tag=" + AFFILIATE_TAG
+                new_text = new_text.replace(orig_u, replaced)
+                print(f"ℹ️ Amazon: no ASIN; appended tag to long url")
+        except Exception as e:
+            print("⚠️ convert_amazon error for", u, e)
+    return new_text
+
+# ---------------- EarnKaro conversion (kept intact) ---------------- #
 async def convert_earnkaro(text):
     """Async EarnKaro conversion (non-blocking). Fallbacks to original URL on failure."""
     if not USE_EARNKARO:
@@ -206,6 +323,7 @@ async def process(text):
     t = await convert_earnkaro(t)
     return t
 
+# ---------------- Product name / canonical / hash helpers ---------------- #
 def extract_product_name(text):
     text_no_urls = re.sub(r'https?://\S+', '', text)
     patterns = [
@@ -262,7 +380,7 @@ def truncate_message(msg):
 def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
-# ---------------- New: Image helpers (minimal, safe) ----------------
+# ---------------- New: Image helpers (unchanged) ----------------
 async def get_og_image_from_page(url: str, timeout_sec: int = 6):
     """Try to extract OG-image or first img src from page (async)."""
     try:
@@ -370,32 +488,74 @@ def build_promotional_image(product_bytes: bytes, badge_text: str = "🔥 Deal",
     except Exception:
         return product_bytes
 
-# ---------------- Updated: send_to_specific_channel now supports optional msg_obj to repost media ----------------
+# ---------------- Updated: send_to_specific_channel now truncates caption & reduces admin spam ----------------
+def _extract_first_url(text):
+    r = re.search(r'(https?://\S+)', text)
+    return r.group(1) if r else ""
+
 async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=None):
     """
     If msg_obj provided and contains image (Telegram media or OG), the bot will attempt to send image+caption.
     Falls back to send_message when no media or if send_file fails.
+    Caption is truncated to avoid SendMediaRequest 'caption too long' errors.
+    On truncated caption, the full message is sent as a follow-up text message (to preserve content).
     """
     try:
-        # Try image extraction only if msg_obj is provided
         if msg_obj is not None:
             try:
                 image_bytes = await extract_image_from_msg_obj(msg_obj)
                 if image_bytes:
-                    # optional overlay
+                    # create promotional image (overlay) if Pillow available
                     promo = build_promotional_image(image_bytes, badge_text="🔥 Deal")
                     bio = io.BytesIO(promo)
                     bio.name = "deal.png"
-                    await client.send_file(channel_id, file=bio, caption=message, link_preview=False)
-                    print(f"✅ Sent image+caption to {channel_name} ({channel_id})")
-                    return True
+
+                    # ensure caption length within safe limits for send_file
+                    CAPTION_SAFE_LIMIT = 900  # safe margin (Telegram's limit ~1024)
+                    caption = message
+                    if len(caption) > CAPTION_SAFE_LIMIT:
+                        # truncate caption but keep a link to full in follow-up text
+                        first_url = _extract_first_url(message) or ""
+                        caption_short = caption[:CAPTION_SAFE_LIMIT - 20].rstrip() + "..."
+                        # add small suffix so user can click More
+                        if first_url:
+                            caption_short += f"\n👉 More: {first_url}"
+                        try:
+                            await client.send_file(channel_id, file=bio, caption=caption_short, link_preview=False)
+                            print(f"✅ Sent image+short-caption to {channel_name} ({channel_id})")
+                        except Exception as e:
+                            # log and notify admin with cooldown
+                            print(f"⚠️ Image send failed for {channel_name}: {e}")
+                            await notify_admin(f"⚠️ Image send failed for {channel_name}: {e}", error_key="image_send_fail")
+                            # fallback to text-only send
+                            await client.send_message(channel_id, message, link_preview=False)
+                            print(f"✅ Fallback: Sent text-only to {channel_name} ({channel_id})")
+                            return True
+
+                        # send the full message as a follow-up text so nothing is lost
+                        try:
+                            await asyncio.sleep(0.6)
+                            await client.send_message(channel_id, message, link_preview=False)
+                        except Exception as e2:
+                            print(f"⚠️ Follow-up full-text send failed for {channel_name}: {e2}")
+                            await notify_admin(f"⚠️ Follow-up send failed for {channel_name}: {e2}", error_key="followup_send_fail")
+                        return True
+                    else:
+                        # caption safe
+                        try:
+                            await client.send_file(channel_id, file=bio, caption=caption, link_preview=False)
+                            print(f"✅ Sent image+caption to {channel_name} ({channel_id})")
+                            return True
+                        except Exception as e:
+                            print(f"⚠️ Image send failed, falling back to text for {channel_name}: {e}")
+                            await notify_admin(f"⚠️ Image send failed for {channel_name}: {e}", error_key="image_send_fail")
+                            # fallback to text send
+                            await client.send_message(channel_id, message, link_preview=False)
+                            return True
             except Exception as e:
                 # if media send fails, fall back to text send and notify admin once
-                print(f"⚠️ Image send failed, falling back to text for {channel_name}: {e}")
-                try:
-                    await notify_admin(f"⚠️ Image send failed for {channel_name}: {e}")
-                except Exception:
-                    pass
+                print(f"⚠️ Image processing failed for {channel_name}: {e}")
+                await notify_admin(f"⚠️ Image processing failed for {channel_name}: {e}", error_key="image_process_fail")
 
         # Default: send text message
         await client.send_message(channel_id, message, link_preview=False)
@@ -403,14 +563,11 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
         return True
     except Exception as ex:
         print(f"❌ Telegram error for {channel_name} ({channel_id}): {ex}")
-        if "two different IP addresses" not in str(ex):
-            try:
-                await notify_admin(f"❌ {channel_name} error ({channel_id}): {ex}")
-            except Exception:
-                pass
+        # avoid spamming admin for repeated same errors
+        await notify_admin(f"❌ {channel_name} error ({channel_id}): {ex}", error_key=str(ex)[:120])
         return False
 
-# ---------------- Updated: process_and_send accepts optional msg_obj to allow media repost ----------------
+# ---------------- Updated: process_and_send (keeps all behavior, adds msg_obj pass) ----------------
 async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg_obj=None):
     if not raw_txt and not getattr(msg_obj, "media", None):
         return False
@@ -495,7 +652,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         # small jitter before sending (stagger across channels)
         await asyncio.sleep(random.uniform(0.5, 2.5))
 
-        # Pass msg_obj so send function can attempt media repost
+        # Pass msg_obj so send function can attempt media repost.  This function handles caption limit.
         success = await send_to_specific_channel(msg, target_channel, channel_name, msg_obj=msg_obj)
 
         if success:
@@ -512,10 +669,10 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         error_msg = f"❌ [{channel_name}] Error processing message: {str(ex)}"
         print(error_msg)
         if "two different IP addresses" not in str(ex):
-            await notify_admin(error_msg)
+            await notify_admin(error_msg, error_key="processing_error")
         return False
 
-# ---------------- Bot main ---------------- #
+# ---------------- Bot main (same flow, preserves all source handling) ----------------
 async def bot_main():
     global last_msg_time, seen_urls, seen_products, seen_channel_1, seen_channel_2
 
@@ -528,10 +685,10 @@ async def bot_main():
         error_msg = f"❌ Session validation failed: {e}"
         print(error_msg)
         if "two different IP addresses" in str(e):
-            await notify_admin("🚨 CRITICAL: Session conflict! Generate NEW STRING_SESSION")
+            await notify_admin("🚨 CRITICAL: Session conflict! Generate NEW STRING_SESSION", error_key="session_conflict")
         return
 
-    await notify_admin("🤖 Bot started successfully! Monitoring different sources for each channel.")
+    await notify_admin("🤖 Bot started successfully! Monitoring different sources for each channel.", error_key="bot_started")
 
     # Connect to source entities for Channel 1
     sources_channel_1 = []
@@ -543,7 +700,7 @@ async def bot_main():
                 print(f"✅ [Channel 1] Connected source: {e.title} ({i})")
             except Exception as ex:
                 print(f"❌ [Channel 1] Failed source {i}: {ex}")
-                await notify_admin(f"❌ [Channel 1] Failed to connect to source {i}: {ex}")
+                await notify_admin(f"❌ [Channel 1] Failed to connect to source {i}: {ex}", error_key=f"src1_{i}")
 
     # Connect to source entities for Channel 2
     sources_channel_2 = []
@@ -555,7 +712,7 @@ async def bot_main():
                 print(f"✅ [Channel 2] Connected source: {e.title} ({i})")
             except Exception as ex:
                 print(f"❌ [Channel 2] Failed source {i}: {ex}")
-                await notify_admin(f"❌ [Channel 2] Failed to connect to source {i}: {ex}")
+                await notify_admin(f"❌ [Channel 2] Failed to connect to source {i}: {ex}", error_key=f"src2_{i}")
 
     print(f"🎯 Channel Configuration:")
     print(f"   Channel 1: {CHANNEL_ID} ({'ENABLED' if USE_CHANNEL_1 else 'DISABLED'}) - {len(sources_channel_1)} sources")
@@ -577,7 +734,7 @@ async def bot_main():
     print("🔄 Bot is now actively monitoring different sources for each channel...")
     await client.run_until_disconnected()
 
-# ---------------- Deploy helpers & monitor ---------------- #
+# ---------------- Deploy helpers & monitor (unchanged) ----------------
 def redeploy_via_hook():
     """Use old webhook hook if provided (synchronous)."""
     if not RENDER_DEPLOY_HOOK:
