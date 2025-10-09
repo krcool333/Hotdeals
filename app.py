@@ -1,7 +1,6 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
 # Preserves your per-channel source routing and in-memory dedupe.
-# Adds: media mode (separate/caption/embedded), single-affiliate-tag enforcement, FORCE_MEDIA toggle,
-# and NIGHT PAUSE (2:00-06:00 by env NIGHT_START_HOUR / NIGHT_END_HOUR).
+# Adds media/image reposting (Telegram media or OG-image fallback) with minimal changes only.
 
 import os
 import re
@@ -15,14 +14,12 @@ import requests
 from threading import Thread
 from flask import Flask, jsonify, request
 import aiohttp
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
-import datetime
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
-# Optional Pillow for embedded-image mode. If not installed, code will fallback.
+# Optional Pillow for overlays; NOT required.
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -55,7 +52,7 @@ PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "500"))
 ADMIN_NOTIFY = os.getenv("ADMIN_NOTIFY", "").strip()  # e.g. @kr_cool
 RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", "").strip()
 
-# Render API credentials (optional)
+# Render API credentials (you provided these values)
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
 
@@ -63,61 +60,11 @@ PORT = int(os.getenv("PORT", "10000"))
 EXTERNAL_URL = os.getenv("EXTERNAL_URL", "").strip()
 
 # Rate limiting & backoff
-MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))
+MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))  # default 60s
 MIN_JITTER = int(os.getenv("MIN_JITTER", "3"))
 MAX_JITTER = int(os.getenv("MAX_JITTER", "12"))
 MAX_REDEPLOYS_PER_DAY = int(os.getenv("MAX_REDEPLOYS_PER_DAY", "3"))
 REDEPLOY_BACKOFF_BASE = int(os.getenv("REDEPLOY_BACKOFF_BASE", "60"))
-
-# ---------------- NEW changes (3) - defaults ----------------
-# CHANGE 1: MEDIA_MODE -> 'separate' | 'caption' | 'embedded'
-MEDIA_MODE = os.getenv("MEDIA_MODE", "separate").lower()  # default 'separate'
-# CHANGE 3: FORCE_MEDIA toggle env
-FORCE_MEDIA = os.getenv("FORCE_MEDIA", "true").lower() == "true"
-
-# ---------------- NIGHT PAUSE (ADDED) ----------------
-# Uses NIGHT_PAUSE_ENABLED, NIGHT_START_HOUR, NIGHT_END_HOUR, NIGHT_TIMEZONE
-NIGHT_PAUSE_ENABLED = os.getenv("NIGHT_PAUSE_ENABLED", "false").lower() == "true"
-NIGHT_START_HOUR = int(os.getenv("NIGHT_START_HOUR", "2"))
-NIGHT_END_HOUR = int(os.getenv("NIGHT_END_HOUR", "6"))
-NIGHT_TIMEZONE = os.getenv("NIGHT_TIMEZONE", "Asia/Kolkata")
-
-# Try timezone libraries: pytz preferred, then zoneinfo (py3.9+), else fallback to server local time.
-try:
-    import pytz
-    TZ_LIB = "pytz"
-except Exception:
-    try:
-        from zoneinfo import ZoneInfo  # Python 3.9+
-        TZ_LIB = "zoneinfo"
-    except Exception:
-        TZ_LIB = None
-
-def is_night_pause_now():
-    """Return True if night pause is enabled and current hour (in NIGHT_TIMEZONE) falls inside window."""
-    if not NIGHT_PAUSE_ENABLED:
-        return False
-    try:
-        if TZ_LIB == "pytz":
-            tz = pytz.timezone(NIGHT_TIMEZONE)
-            now = datetime.datetime.now(tz)
-        elif TZ_LIB == "zoneinfo":
-            tz = ZoneInfo(NIGHT_TIMEZONE)
-            now = datetime.datetime.now(tz)
-        else:
-            # Fallback - server local time (less reliable). Use warning in logs.
-            now = datetime.datetime.now()
-        hour = now.hour
-        start = NIGHT_START_HOUR % 24
-        end = NIGHT_END_HOUR % 24
-        if start < end:
-            return start <= hour < end
-        else:
-            # wrap-around (e.g., 22 -> 06)
-            return hour >= start or hour < end
-    except Exception as e:
-        print(f"⚠️ Night pause check failed: {e}")
-        return False
 
 # ---------------- DIFFERENT SOURCES ---------------- #
 SOURCE_IDS_CHANNEL_1 = [
@@ -151,12 +98,13 @@ HASHTAG_SETS = [
     "#PriceDrop #FlashSale #DealAlert",
 ]
 
-# ---------------- Runtime state ---------------- #
+# ---------------- Runtime in-memory state (no Redis) ---------------- #
 seen_urls = set()
+seen_products = {}
 seen_channel_1 = {}
 seen_channel_2 = {}
 last_msg_time = time.time()
-last_sent_channel = {}
+last_sent_channel = {}   # channel_name -> timestamp
 redeploy_count_today = 0
 last_redeploy_time = 0
 
@@ -210,34 +158,24 @@ async def expand_all(text):
                 print(f"⚠️ Expansion failed for {u}: {e}")
     return text
 
-# ---------------- CHANGE 2: Single affiliate tag enforcement ----------------
-def ensure_affiliate_tag(url: str) -> str:
-    """Return url with single affiliate tag param (AFFILIATE_TAG)."""
-    try:
-        parts = urlparse(url)
-        qs = dict(parse_qsl(parts.query, keep_blank_values=True))
-        qs['tag'] = AFFILIATE_TAG
-        new_query = urlencode(qs, doseq=True)
-        new_parts = parts._replace(query=new_query)
-        return urlunparse(new_parts)
-    except Exception:
-        return url
-
-def convert_amazon(text: str) -> str:
-    """
-    Replace/add affiliate tag for any Amazon product links found in text.
-    Ensures a single tag parameter.
-    """
+def convert_amazon(text):
+    """Force Amazon affiliate tag (replace existing tag or add ours)."""
+    # Replace existing tag parameters
+    text = re.sub(r'([?&])tag=[^&\s&]+', r'\1tag=' + AFFILIATE_TAG, text)
+    # Handle Amazon product links without tags
+    pat = r'(https?://(?:www\.)?amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10}))'
     def repl(m):
-        full = m.group(0)
-        fixed = ensure_affiliate_tag(full)
-        return fixed
+        asin = m.group(2)
+        url = m.group(1)
+        if '?' in url:
+            return f"{url}&tag={AFFILIATE_TAG}"
+        else:
+            return f"https://www.amazon.in/dp/{asin}/?tag={AFFILIATE_TAG}"
+    text = re.sub(pat, repl, text, flags=re.I)
+    return text
 
-    pat = re.compile(r'https?://(?:www\.)?amazon\.(?:in|com)/(?:.*?/)?(?:dp|gp/product)/[A-Z0-9]{10}[^ \n]*', flags=re.I)
-    return pat.sub(repl, text)
-
-# Earnkaro conversion (same)
 async def convert_earnkaro(text):
+    """Async EarnKaro conversion (non-blocking). Fallbacks to original URL on failure."""
     if not USE_EARNKARO:
         return text
     urls = re.findall(r"(https?://\S+)", text)
@@ -271,16 +209,19 @@ async def process(text):
 def extract_product_name(text):
     text_no_urls = re.sub(r'https?://\S+', '', text)
     patterns = [
-        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi)\s+[^@\n]+?(?=@|₹|http|$)",
+        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper|Fitspire)\s+[^@\n]+?(?=@|₹|http|$)",
         r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|GB|TB|MB|mAh|MP|Hz))+(?=@|₹|http|$)",
+        r"Upto\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
+        r"Flat\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
         r"([A-Za-z][^@\n]{10,}?(?=@|₹|http|\n|$))",
     ]
     for p in patterns:
         m = re.search(p, text_no_urls, re.IGNORECASE)
         if m:
-            product_name = m.group(0).strip()
-            if len(product_name) > 10:
-                return product_name
+            prod = m.group(0).strip()
+            prod = re.sub(r'^(Upto|Flat)\s+\d+%\s+Off\s+On\s+', '', prod, flags=re.IGNORECASE)
+            if len(prod) > 10:
+                return prod
     return None
 
 def canonicalize(url):
@@ -321,8 +262,9 @@ def truncate_message(msg):
 def choose_hashtags():
     return random.choice(HASHTAG_SETS)
 
-# ---------------- Image helpers ----------------
+# ---------------- New: Image helpers (minimal, safe) ----------------
 async def get_og_image_from_page(url: str, timeout_sec: int = 6):
+    """Try to extract OG-image or first img src from page (async)."""
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
         async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -344,6 +286,7 @@ async def get_og_image_from_page(url: str, timeout_sec: int = 6):
     return None
 
 async def fetch_image_bytes(url: str, timeout_sec: int = 8):
+    """Fetch image bytes via aiohttp (async)."""
     if not url:
         return None
     try:
@@ -359,6 +302,11 @@ async def fetch_image_bytes(url: str, timeout_sec: int = 8):
     return None
 
 async def extract_image_from_msg_obj(msg_obj):
+    """
+    1) If msg_obj has Telegram media, download it.
+    2) Else, try OG-image from first URL in message text.
+    Returns bytes or None.
+    """
     try:
         if getattr(msg_obj, "media", None):
             b = io.BytesIO()
@@ -373,6 +321,7 @@ async def extract_image_from_msg_obj(msg_obj):
     except Exception:
         pass
 
+    # fallback: detect first URL and scrape OG image
     try:
         text = msg_obj.message or ""
         urls = re.findall(r"(https?://\S+)", text)
@@ -390,170 +339,68 @@ async def extract_image_from_msg_obj(msg_obj):
 
     return None
 
-def build_embedded_image(text_top: str, product_bytes: bytes, max_width: int = 900) -> bytes:
+def build_promotional_image(product_bytes: bytes, badge_text: str = "🔥 Deal", price_text: str = None):
     """
-    Compose a new image where the top area contains wrapped text (text_top),
-    and the product image is below. Requires Pillow. Returns PNG bytes.
+    Optional: overlay badge and price using Pillow if available.
+    If Pillow not installed, returns original bytes unchanged.
     """
     if not PIL_AVAILABLE:
-        raise RuntimeError("Pillow not installed for embedded mode")
+        return product_bytes
     try:
-        prod_im = Image.open(io.BytesIO(product_bytes)).convert("RGBA")
-        if prod_im.width > max_width:
-            ratio = max_width / prod_im.width
-            prod_im = prod_im.resize((max_width, int(prod_im.height * ratio)), Image.LANCZOS)
-
+        im = Image.open(io.BytesIO(product_bytes)).convert("RGBA")
+        max_width = 900
+        if im.width > max_width:
+            ratio = max_width / im.width
+            im = im.resize((max_width, int(im.height * ratio)), Image.LANCZOS)
+        draw = ImageDraw.Draw(im)
         try:
-            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
         except Exception:
             font = ImageFont.load_default()
-
-        draw_temp = ImageDraw.Draw(prod_im)
-        wrap_width = prod_im.width - 20
-        words = text_top.split()
-        lines = []
-        line = ""
-        for w in words:
-            if draw_temp.textsize((line + " " + w).strip(), font=font)[0] <= wrap_width:
-                line = (line + " " + w).strip()
-            else:
-                lines.append(line)
-                line = w
-        if line:
-            lines.append(line)
-        text_height = sum(draw_temp.textsize(l, font=font)[1] + 6 for l in lines) + 16
-
-        final_h = text_height + prod_im.height + 20
-        final_im = Image.new("RGBA", (prod_im.width + 20, final_h), (255, 255, 255, 255))
-        draw = ImageDraw.Draw(final_im)
-        y = 8
-        for ln in lines:
-            draw.text((10, y), ln, font=font, fill=(0, 0, 0))
-            y += draw.textsize(ln, font=font)[1] + 6
-        final_im.paste(prod_im, (10, text_height + 8), prod_im if prod_im.mode == "RGBA" else None)
-
+        draw.rectangle([(10, 10), (240, 10 + 40)], fill=(255, 69, 0, 220))
+        draw.text((18, 14), badge_text, font=font, fill="white")
+        if price_text:
+            h = im.height
+            draw.rectangle([(0, h - 44), (im.width, h)], fill=(0, 0, 0, 200))
+            draw.text((12, h - 36), price_text, font=font, fill="white")
         out = io.BytesIO()
-        final_im.save(out, format="PNG")
+        im.save(out, format="PNG")
         out.seek(0)
         return out.read()
-    except Exception as e:
-        raise
+    except Exception:
+        return product_bytes
 
-# ---------------- Sending logic: supports MEDIA_MODE and FORCE_MEDIA ----------------
+# ---------------- Updated: send_to_specific_channel now supports optional msg_obj to repost media ----------------
 async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=None):
     """
-    MEDIA_MODE handling:
-      - 'separate' : sends text first (clickable), then image as separate message (image below).
-      - 'caption'  : single message — image with caption (caption below image).
-      - 'embedded' : single image composed with text on top and product image below (requires Pillow).
-    FORCE_MEDIA False -> only send text (no media).
+    If msg_obj provided and contains image (Telegram media or OG), the bot will attempt to send image+caption.
+    Falls back to send_message when no media or if send_file fails.
     """
     try:
-        # Respect FORCE_MEDIA
-        if not FORCE_MEDIA:
-            await client.send_message(channel_id, message, link_preview=False)
-            print(f"✅ Sent text-only to {channel_name} ({channel_id}) due to FORCE_MEDIA=false")
-            return True
-
-        # Try to extract image bytes if message object provided
-        image_bytes = None
+        # Try image extraction only if msg_obj is provided
         if msg_obj is not None:
             try:
                 image_bytes = await extract_image_from_msg_obj(msg_obj)
+                if image_bytes:
+                    # optional overlay
+                    promo = build_promotional_image(image_bytes, badge_text="🔥 Deal")
+                    bio = io.BytesIO(promo)
+                    bio.name = "deal.png"
+                    await client.send_file(channel_id, file=bio, caption=message, link_preview=False)
+                    print(f"✅ Sent image+caption to {channel_name} ({channel_id})")
+                    return True
             except Exception as e:
-                print(f"⚠️ Image extraction error: {e}")
-                image_bytes = None
-
-        # MEDIA_MODE behavior
-        mode = MEDIA_MODE or "separate"
-        # default fallbacks if unsupported mode or missing dependencies
-        if mode == "embedded" and not PIL_AVAILABLE:
-            # fallback to caption (safer) if Pillow missing
-            mode = "caption"
-
-        # Option: if no image found, just send text
-        if not image_bytes:
-            await client.send_message(channel_id, message, link_preview=False)
-            print(f"✅ Sent text to {channel_name} ({channel_id}) (no image found)")
-            return True
-
-        # Mode: separate -> text then image (keeps link clickable)
-        if mode == "separate":
-            try:
-                await client.send_message(channel_id, message, link_preview=False)
-                print(f"✅ Sent text to {channel_name} ({channel_id}) (separate mode)")
-            except Exception as e_text:
-                print(f"❌ Failed to send text to {channel_name}: {e_text}")
-                if "two different IP addresses" not in str(e_text):
-                    try:
-                        await notify_admin(f"❌ {channel_name} text send failed: {e_text}")
-                    except Exception:
-                        pass
-                return False
-            await asyncio.sleep(0.7)
-            try:
-                bio = io.BytesIO(image_bytes)
-                bio.name = "deal.png"
-                await client.send_file(channel_id, file=bio, caption=None, link_preview=False)
-                print(f"✅ Sent image to {channel_name} ({channel_id}) (separate mode)")
-                return True
-            except Exception as e_img:
-                print(f"⚠️ Image send failed for {channel_name}, text already sent: {e_img}")
+                # if media send fails, fall back to text send and notify admin once
+                print(f"⚠️ Image send failed, falling back to text for {channel_name}: {e}")
                 try:
-                    await notify_admin(f"⚠️ Image send failed for {channel_name}: {e_img}")
+                    await notify_admin(f"⚠️ Image send failed for {channel_name}: {e}")
                 except Exception:
                     pass
-                return True  # text already sent -> treat as success
 
-        # Mode: caption -> single message: image + caption (caption below image)
-        elif mode == "caption":
-            try:
-                promo = image_bytes
-                if PIL_AVAILABLE:
-                    try:
-                        # small optional overlay: use embedded composer with empty top text to standardize size if wanted
-                        promo = image_bytes
-                    except Exception:
-                        promo = image_bytes
-                bio = io.BytesIO(promo)
-                bio.name = "deal.png"
-                await client.send_file(channel_id, file=bio, caption=message, link_preview=False)
-                print(f"✅ Sent image+caption to {channel_name} ({channel_id}) (caption mode)")
-                return True
-            except Exception as e:
-                print(f"❌ Caption-mode send failed: {e}")
-                if "two different IP addresses" not in str(e):
-                    try:
-                        await notify_admin(f"❌ {channel_name} caption send failed: {e}")
-                    except Exception:
-                        pass
-                return False
-
-        # Mode: embedded -> compose image with text on top (single message, link not clickable)
-        elif mode == "embedded":
-            try:
-                try:
-                    final_bytes = build_embedded_image(message, image_bytes)
-                except Exception as e_embed:
-                    print(f"⚠️ Embedded compose failed: {e_embed} (falling back to caption mode)")
-                    final_bytes = image_bytes
-                bio = io.BytesIO(final_bytes)
-                bio.name = "deal.png"
-                await client.send_file(channel_id, file=bio, caption=None, link_preview=False)
-                print(f"✅ Sent embedded image to {channel_name} ({channel_id}) (embedded mode)")
-                return True
-            except Exception as e:
-                print(f"❌ Embedded-mode send failed: {e}")
-                if "two different IP addresses" not in str(e):
-                    try:
-                        await notify_admin(f"❌ {channel_name} embedded send failed: {e}")
-                    except Exception:
-                        pass
-                return False
-
-        else:
-            # unknown mode -> fallback to separate
-            return await send_to_specific_channel(message, channel_id, channel_name, msg_obj)
+        # Default: send text message
+        await client.send_message(channel_id, message, link_preview=False)
+        print(f"✅ Sent to {channel_name} ({channel_id})")
+        return True
     except Exception as ex:
         print(f"❌ Telegram error for {channel_name} ({channel_id}): {ex}")
         if "two different IP addresses" not in str(ex):
@@ -563,13 +410,8 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
                 pass
         return False
 
-# ---------------- Updated process_and_send accepts optional msg_obj ----------------
+# ---------------- Updated: process_and_send accepts optional msg_obj to allow media repost ----------------
 async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg_obj=None):
-    # --- NIGHT PAUSE CHECK (NEW) ---
-    if is_night_pause_now():
-        print(f"⏸️ Night pause active ({NIGHT_START_HOUR}:00-{NIGHT_END_HOUR}:00 {NIGHT_TIMEZONE}) - skipping message")
-        return False
-
     if not raw_txt and not getattr(msg_obj, "media", None):
         return False
 
@@ -653,6 +495,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         # small jitter before sending (stagger across channels)
         await asyncio.sleep(random.uniform(0.5, 2.5))
 
+        # Pass msg_obj so send function can attempt media repost
         success = await send_to_specific_channel(msg, target_channel, channel_name, msg_obj=msg_obj)
 
         if success:
@@ -674,12 +517,13 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
 
 # ---------------- Bot main ---------------- #
 async def bot_main():
-    global last_msg_time, seen_urls, seen_channel_1, seen_channel_2
+    global last_msg_time, seen_urls, seen_products, seen_channel_1, seen_channel_2
 
     try:
         await client.start()
         me = await client.get_me()
         print(f"✅ Logged in as: {me.first_name} (ID: {me.id})")
+        await client.get_me()
     except Exception as e:
         error_msg = f"❌ Session validation failed: {e}"
         print(error_msg)
@@ -735,6 +579,7 @@ async def bot_main():
 
 # ---------------- Deploy helpers & monitor ---------------- #
 def redeploy_via_hook():
+    """Use old webhook hook if provided (synchronous)."""
     if not RENDER_DEPLOY_HOOK:
         return False
     try:
@@ -746,6 +591,7 @@ def redeploy_via_hook():
         return False
 
 async def trigger_render_deploy_async():
+    """Trigger Render deploy via official API (async)."""
     api_key = RENDER_API_KEY
     service_id = RENDER_SERVICE_ID
     if not api_key or not service_id:
@@ -768,9 +614,10 @@ async def trigger_render_deploy_async():
         return False
 
 def monitor_health():
+    """Background monitor that triggers redeploy with exponential backoff."""
     global last_msg_time, redeploy_count_today, last_redeploy_time
     while True:
-        time.sleep(300)
+        time.sleep(300)  # check every 5 minutes
         idle = time.time() - last_msg_time
         if idle > 1800:
             now = time.time()
@@ -782,6 +629,7 @@ def monitor_health():
                 print(f"ℹ️ Waiting backoff before deploy: {int(wait - (now - last_redeploy_time))}s left")
                 continue
             print("⚠️ Idle 30+ min, attempting redeploy (Render API preferred)")
+            # Prefer Render API if keys present, fallback to hook
             triggered = False
             if RENDER_API_KEY and RENDER_SERVICE_ID:
                 try:
@@ -800,7 +648,7 @@ def monitor_health():
 # ---------------- Keep-alive ping loop ---------------- #
 def keep_alive():
     while True:
-        time.sleep(300)
+        time.sleep(300)  # every 5 minutes
         try:
             requests.get(f"http://127.0.0.1:{PORT}/ping", timeout=5)
             print("✅ Internal ping successful")
@@ -852,9 +700,11 @@ def stats():
 
 @app.route("/redeploy", methods=["POST"])
 def redeploy_endpoint():
+    # safe synchronous redeploy that uses Render API if configured
     triggered = False
     if RENDER_API_KEY and RENDER_SERVICE_ID:
         try:
+            # run async trigger
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             triggered = loop.run_until_complete(trigger_render_deploy_async())
@@ -867,6 +717,7 @@ def redeploy_endpoint():
 
 # ---------------- Entrypoint ---------------- #
 if __name__ == "__main__":
+    # start bot
     loop = asyncio.new_event_loop()
     Thread(target=lambda: asyncio.set_event_loop(loop) or loop.run_until_complete(bot_main()), daemon=True).start()
     Thread(target=keep_alive, daemon=True).start()
