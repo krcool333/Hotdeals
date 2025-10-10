@@ -82,8 +82,6 @@ SOURCE_IDS_CHANNEL_1 = [
     -1001767957702,  # Transparent Deals
     -1001387180060,  # Crazy Offers Deals - COD
     -1001378801949   # UNIVERSAL DEALS
-    -1001825299837   # Crazy Online Deals
-    -1002444882171   # Under 99rs Loot Deals
 ]
 
 SOURCE_IDS_CHANNEL_2 = [
