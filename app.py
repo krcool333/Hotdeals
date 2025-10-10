@@ -1,9 +1,6 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
-# - Multi-channel repost bot with per-channel beautify formatting toggles
-# - Strict Amazon ASIN handling + fallback to original+tag
-# - EarnKaro support retained
-# - Per-channel dedupe, per-channel rate limits, health endpoints, redeploy hooks
-# - No night pause. Pillow overlay kept but not used by default.
+# All previous features preserved + improved price parsing in beautifier
+# Keep all toggles, channels, dedupe, EarnKaro, Render hooks, etc.
 
 import os
 import re
@@ -24,7 +21,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
-# Optional Pillow for overlays; kept for compatibility but not used by default
+# Optional Pillow for overlays; kept but not used by default
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -48,7 +45,7 @@ USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
 USE_CHANNEL_2 = os.getenv("USE_CHANNEL_2", "true").lower() == "true"
 USE_CHANNEL_3 = os.getenv("USE_CHANNEL_3", "false").lower() == "true"
 
-# New per-channel formatting toggles
+# Per-channel formatting toggles
 FORMAT_CHANNEL_1 = os.getenv("FORMAT_CHANNEL_1", "true").lower() == "true"
 FORMAT_CHANNEL_2 = os.getenv("FORMAT_CHANNEL_2", "true").lower() == "true"
 FORMAT_CHANNEL_3 = os.getenv("FORMAT_CHANNEL_3", "false").lower() == "true"
@@ -83,25 +80,25 @@ _ADMIN_NOTIFY_COOLDOWN = int(os.getenv("ADMIN_NOTIFY_COOLDOWN", "600"))
 
 # ---------------- Sources ---------------- #
 SOURCE_IDS_CHANNEL_1 = [
-    -1001448358487,  # Yaha Everything
-    -1001767957702,  # Transparent Deals
-    -1001387180060,  # Crazy Offers Deals - COD
-    -1001378801949   # UNIVERSAL DEALS
+    -1001448358487,
+    -1001767957702,
+    -1001387180060,
+    -1001378801949
 ]
 
 SOURCE_IDS_CHANNEL_2 = [
-    -1001505338947,  # Online Dealz Broadcast
-    -1001561964907,  # 2.0 LCBD Loot Deals
-    -1001450755585,  # Trending Loot Deals
-    -1001820593092,  # Steadfast Deal
-    -1001351555431   # LOOT लो!! Deals Offers
+    -1001505338947,
+    -1001561964907,
+    -1001450755585,
+    -1001820593092,
+    -1001351555431
 ]
 
 SOURCE_IDS_CHANNEL_3 = [
-    -1001716333902,  # Trick Xpert 2.0
-    -1002444882171,  # Under 99rs Loot Deals 🤘🏻
-    -1001767957702,  # Transparent Deals
-    -1001825299837   # Crazy Online Deals
+    -1001716333902,
+    -1002444882171,
+    -1001767957702,
+    -1001825299837
 ]
 
 SHORT_PATTERNS = [
@@ -113,7 +110,7 @@ SHORT_PATTERNS = [
     r"(https?://fkt\.co/\S+)"
 ]
 
-# Default global hashtags (fallback)
+# Default hashtags and channel-specific config
 HASHTAG_SETS = [
     "#LootDeals #Discount #OnlineShopping",
     "#FAST #Offer #Sale",
@@ -125,15 +122,12 @@ HASHTAG_SETS = [
     "#DesiDeals #BestBuy #Discount",
 ]
 
-# Channel-specific hashtag sets (can be customized)
 CHANNEL_HASHTAGS = {
-    # channel_id: list or string (we'll pick one at random if list)
     CHANNEL_ID: ["#LootFast #HotDeals #StealOffer"],
     CHANNEL_ID_2: ["#CrazyLoot #DealZone #OfferAlert"],
     CHANNEL_ID_3: ["#DealsKing #BestOffers #DailyLoot"],
 }
 
-# Channel-specific emoji packs (for style in beautifier)
 CHANNEL_EMOJI = {
     CHANNEL_ID: ["🔥", "💥", "🛒"],
     CHANNEL_ID_2: ["⚡", "🎁", "🤑"],
@@ -354,7 +348,7 @@ async def process(text):
     t = await convert_earnkaro(t)
     return t
 
-# ---------------- Beautify: build attractive post text (Option B: all deals) ---------------- #
+# ---------------- Beautify: improved, line-based price parsing ---------------- #
 def _first_url(text):
     m = re.search(r'(https?://\S+)', text)
     return m.group(1) if m else ""
@@ -367,11 +361,8 @@ def _parse_price_token(tok):
         return None
 
 def get_channel_style_for_formatting(target_channel_id):
-    """Return channel-specific style: emoji list and hashtag string (picked from CHANNEL_HASHTAGS)."""
-    # Default fallback styles
     default_emoji = ["🔥", "🛒", "✨"]
     default_hashtag = random.choice(HASHTAG_SETS)
-
     emoji = CHANNEL_EMOJI.get(target_channel_id, default_emoji)
     hashtags_list = CHANNEL_HASHTAGS.get(target_channel_id)
     if isinstance(hashtags_list, list):
@@ -382,80 +373,109 @@ def get_channel_style_for_formatting(target_channel_id):
         hashtag = default_hashtag
     return {"emoji": emoji, "hashtag": hashtag}
 
+def extract_prices_from_text(text):
+    # find tokens with ₹, Rs., INR, or @ followed by digits (keeps order)
+    tokens = re.findall(r'(?:₹\s*[0-9\.,]+|Rs\.?\s*[0-9\.,]+|INR\s*[0-9\.,]+|@\s*[0-9\.,]+)', text, flags=re.I)
+    vals = []
+    for t in tokens:
+        v = _parse_price_token(t)
+        if v:
+            vals.append(v)
+    return vals
+
 def beautify_deal_message(raw_text, target_channel_id):
     """
-    Attempt to extract structured information and produce a clean multi-line post.
-    Applies to all deals when a ₹ price is present (Option B).
-    Fields extracted (best-effort): product name, was_price, now_price, discount %, rating, free delivery, bought count.
-    Uses channel-specific emoji/hashtag style.
-    If not enough info, returns None so caller can keep original message.
+    Robust beautifier that prefers prices on the same line as the product name.
+    Returns None if it can't confidently format.
     """
-    if not raw_text or "₹" not in raw_text:
+    if not raw_text or ("₹" not in raw_text and "@" not in raw_text and "Rs" not in raw_text and "INR" not in raw_text):
         return None
 
     style = get_channel_style_for_formatting(target_channel_id)
     emoji_pack = style.get("emoji", [])
     hashtag = style.get("hashtag", "")
 
-    # Normalize whitespace and lines
     lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    if not lines:
+        return None
     text_join = " ".join(lines)
-
-    # Extract first URL (to be appended later)
     link = _first_url(raw_text) or ""
 
-    # Prices: "₹1,234", "Rs. 1,234", etc.
-    price_tokens = re.findall(r'₹\s*[0-9\.,]+', raw_text)
-    prices = [_parse_price_token(t) for t in price_tokens if _parse_price_token(t) is not None]
-
-    # Discount percent (like 65% OFF)
-    disc_match = re.search(r'(\d{1,2}(?:\.\d)?)\s*%[^\w]{0,2}\s*off', raw_text, flags=re.I)
-    disc = None
-    if disc_match:
-        try:
-            disc = f"{float(disc_match.group(1)):.0f}%"
-        except Exception:
-            disc = disc_match.group(1) + "%"
-
-    # Rating patterns: "4.3/5", "4.3 out of 5", "⭐️ 4.3"
-    rating_match = re.search(r'(\d(?:\.\d)?)\s*(?:/5|out of 5|stars?)', raw_text, flags=re.I)
-    rating = rating_match.group(1) if rating_match else None
-
-    # Bought / sold count
-    bought_match = re.search(r'(\d{1,3}(?:[,\d]{0,})?)\s*\+\s*(?:bought|sold|orders|orders today|bought today)', raw_text, flags=re.I)
-    if not bought_match:
-        bought_match = re.search(r'(\d{1,3}(?:[,\d]{0,})?)\s*(?:bought|sold|orders|orders today|bought today)', raw_text, flags=re.I)
-    bought = None
-    if bought_match:
-        bought = bought_match.group(1).replace(",", "")
-
-    # Free delivery detection
-    free_delivery = bool(re.search(r'free\s+delivery', raw_text, flags=re.I))
-
-    # Product name: best-effort - take first line that isn't just "Buy Here" or a link and not promo-only
-    product_name = None
-    for ln in lines[:3]:
-        if "http" in ln.lower() or "buy here" in ln.lower() or len(ln) < 4:
+    # choose product line index (best-effort within first few lines)
+    product_line_idx = None
+    for idx, ln in enumerate(lines[:6]):
+        if "http" in ln.lower():
             continue
         if len(re.sub(r'[^A-Za-z0-9 ]', '', ln)) < 4:
             continue
-        product_name = ln
+        product_line_idx = idx
         break
+    if product_line_idx is None:
+        product_line_idx = 0
+
+    product_line = lines[product_line_idx]
+
+    # Clean product name by removing price tokens like @29,490 or ₹29,490
+    product_name = re.sub(r'(?:@|₹|Rs\.?|INR)\s*[0-9\.,]+', '', product_line).strip(" -:•")
     if not product_name:
-        snippet = re.split(r'http|₹', text_join)[0].strip()
+        snippet = re.split(r'http|₹|@|Rs|INR', text_join)[0].strip()
         product_name = snippet[:80].strip() if snippet else None
 
-    now_price = prices[0] if prices else None
-    was_price = prices[1] if len(prices) > 1 else None
+    # 1) Prefer prices from product_line
+    candidates = extract_prices_from_text(product_line)
+    # 2) Next prefer adjacent lines (next, then prev)
+    if not candidates and product_line_idx + 1 < len(lines):
+        candidates = extract_prices_from_text(lines[product_line_idx + 1])
+    if not candidates and product_line_idx - 1 >= 0:
+        candidates = extract_prices_from_text(lines[product_line_idx - 1])
+    # 3) fallback to full message prices
+    if not candidates:
+        candidates = extract_prices_from_text(text_join)
 
+    was_price = None
+    now_price = None
+    disc = None
+
+    # explicit context check for "was ... now ..."
+    context = product_line + " " + (lines[product_line_idx + 1] if product_line_idx + 1 < len(lines) else "")
+    m = re.search(r'was[:\s]*((?:₹|@|Rs\.?|INR)\s*[0-9\.,]+).*?now[:\s]*((?:₹|@|Rs\.?|INR)\s*[0-9\.,]+)', context, flags=re.I)
+    if m:
+        was_price = _parse_price_token(m.group(1))
+        now_price = _parse_price_token(m.group(2))
+    else:
+        # heuristics based on extracted candidates (order preserved)
+        if candidates:
+            if len(candidates) == 1:
+                now_price = candidates[0]
+            else:
+                # if first candidate is larger than second -> likely was:first now:second
+                if candidates[0] > candidates[1]:
+                    was_price = candidates[0]
+                    now_price = candidates[1]
+                else:
+                    # otherwise use first as now and second maybe other context; still set now to first
+                    now_price = candidates[0]
+                    # optionally if a later candidate is much larger and seems relevant, ignore small ones
+                    # (keep it simple and conservative)
+    # compute discount if possible
+    if was_price and now_price and was_price > now_price:
+        disc_pct = int(round(100.0 * (was_price - now_price) / float(was_price)))
+        disc = f"{disc_pct}%"
+    else:
+        dm = re.search(r'(\d{1,2}(?:\.\d)?)\s*%[^\w]{0,2}\s*off', raw_text, flags=re.I)
+        if dm:
+            try:
+                disc = f"{float(dm.group(1)):.0f}%"
+            except Exception:
+                disc = dm.group(1) + "%"
+
+    # If we couldn't find product_name nor any price, bail
     if not product_name and not now_price:
         return None
 
-    # Build formatted message (plain text, no markdown parse mode)
+    # Build formatted output (plain text)
     parts = []
-
-    # header with emoji (pick first emoji)
-    header_emoji = emoji_pack[0] + " " if emoji_pack else ""
+    header_emoji = (emoji_pack[0] + " ") if emoji_pack else ""
     if product_name:
         parts.append(f"{header_emoji}GENUINE DEAL: {product_name}")
 
@@ -472,11 +492,17 @@ def beautify_deal_message(raw_text, target_channel_id):
         parts.append(price_line)
 
     extra = []
-    if rating:
-        extra.append(f"⭐ {rating}/5")
-    if free_delivery:
+    # rating detection anywhere in message
+    rating_match = re.search(r'(\d(?:\.\d)?)\s*(?:/5|out of 5|stars?)', raw_text, flags=re.I)
+    if rating_match:
+        extra.append(f"⭐ {rating_match.group(1)}/5")
+    if re.search(r'free\s+delivery', raw_text, flags=re.I):
         extra.append("🚚 Free Delivery")
-    if bought:
+    bought_match = re.search(r'(\d{1,3}(?:[,\d]{0,})?)\s*\+\s*(?:bought|sold|orders|orders today|bought today)', raw_text, flags=re.I)
+    if not bought_match:
+        bought_match = re.search(r'(\d{1,3}(?:[,\d]{0,})?)\s*(?:bought|sold|orders|orders today|bought today)', raw_text, flags=re.I)
+    if bought_match:
+        bought = bought_match.group(1).replace(",", "")
         extra.append(f"📦 {bought}+ bought")
     if extra:
         parts.append(" | ".join(extra))
@@ -655,7 +681,6 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         processed = await process(raw_txt or "")
         urls = re.findall(r"https?://\S+", processed)
 
-        # If no URLs and no media, skip
         if not urls and not getattr(msg_obj, "media", None):
             print(f"⚠️ [{channel_name}] Skipped: No valid URLs found after processing and no media")
             return False
@@ -663,7 +688,6 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         now = time.time()
         dedupe_keys = []
 
-        # dedupe by canonical product keys
         for u in urls:
             c = canonicalize(u)
             if c:
@@ -674,7 +698,6 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
                 else:
                     print(f"⚠️ [{channel_name}] Duplicate URL skipped (seen {int(now - last_seen)}s ago): {c}")
 
-        # dedupe by text hash
         text_key = hash_text(processed)
         last_seen = seen_dict.get(text_key)
         if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
@@ -683,18 +706,15 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         else:
             print(f"⚠️ [{channel_name}] Duplicate text skipped (seen {int(now - last_seen)}s ago): {text_key}")
 
-        # Only skip if BOTH URL and text are duplicates
         if not dedupe_keys:
             print(f"⚠️ [{channel_name}] Skipped: All dedupe keys are duplicates")
             return False
 
-        # Update seen for this channel
         for k in dedupe_keys:
             seen_dict[k] = now
         for u in urls:
             seen_urls.add(u)
 
-        # labels
         label = ""
         all_urls = urls
         if any("amazon" in u for u in all_urls):
@@ -708,7 +728,6 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         else:
             label = "🎯 Fast Deal:\n"
 
-        # Decide whether to apply beautify formatting based on target channel flags
         apply_format = False
         if target_channel == CHANNEL_ID and FORMAT_CHANNEL_1 and USE_CHANNEL_1:
             apply_format = True
@@ -728,7 +747,6 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
 
         print(f"📤 [{channel_name}] Prepared message: {final_msg[:160]}...")
 
-        # --- RATE LIMIT PER CHANNEL (avoid bursts / spam flags) ---
         now_ts = time.time()
         last = last_sent_channel.get(channel_name, 0)
         if channel_name.lower().startswith("channel 1"):
@@ -744,7 +762,6 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
             print(f"⏱️ Rate limit: skip {channel_name}. Need {int(need_wait - (now - last))}s more.")
             return False
 
-        # small jitter before sending (stagger across channels)
         await asyncio.sleep(random.uniform(0.5, 2.5))
 
         success = await send_to_specific_channel(final_msg, target_channel, channel_name, msg_obj=msg_obj)
