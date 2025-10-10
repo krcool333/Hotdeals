@@ -1,7 +1,8 @@
-# app.py - FASTDEALS Bot (final, ready-to-paste)
-# - ASIN pattern validation (no network verification for short links) — faster
-# - Night pause removed
-# - Keeps multi-channel sources, dedupe, EarnKaro, media fallback, render ping, etc.
+# app.py - FASTDEALS Bot (final patch: stricter ASIN validation + fallback logging)
+# - Rejects ASIN tokens that are 10 letters-only (e.g., 'ELECTRONIC') to avoid broken dp/ links
+# - If no valid ASIN found, falls back to original expanded URL with affiliate tag appended
+# - Logs fallback events to amazon_fallbacks.log for auditing
+# - No night pause, no network verification (fast), EarnKaro kept, other features unchanged
 import os
 import re
 import time
@@ -207,7 +208,7 @@ async def expand_all(text):
                 print(f"⚠️ Expansion failed for {u}: {e}")
     return text
 
-# ---------------- Improved Amazon canonicalizer (no network verification) ---------------- #
+# ---------------- Improved Amazon canonicalizer (stricter ASIN validation, no network verification) ---------------- #
 def _find_asins_in_string(s):
     """Return list of all 10-char alnum sequences that look like ASINs (uppercased)."""
     tokens = re.findall(r'([A-Z0-9]{10})', s, flags=re.I)
@@ -227,13 +228,23 @@ def _first_asin_from_qs(qs):
                 return first.upper()
     return None
 
+def _log_fallback(orig_url, chosen_asin, replacement):
+    try:
+        with open("amazon_fallbacks.log", "a", encoding="utf-8") as f:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            f.write(f"{ts}\torig={orig_url}\tchosen_asin={chosen_asin}\trepl={replacement}\n")
+    except Exception:
+        pass
+
 async def convert_amazon_async(text):
     """
     Async version: Replace Amazon/store URLs with short affiliate product links.
     - Extract ASINs from many patterns.
     - If multiple ASINs exist, choose the most frequent ASIN.
     - Build short link https://www.amazon.in/dp/<ASIN>/?tag=<AFFILIATE_TAG>.
-    - NO network verification (faster). If no valid ASIN found, fallback to original URL with tag appended.
+    - NO network verification (faster).
+    - Stricter rule: chosen ASIN must contain at least one digit (to avoid category words like ELECTRONIC).
+    - If no valid ASIN, fallback to original URL with tag appended.
     - Does NOT append 'More (full list)' — single short link only (or fallback original+tag).
     """
     if not text:
@@ -295,7 +306,12 @@ async def convert_amazon_async(text):
                 count = Counter(asins)
                 chosen_asin = count.most_common(1)[0][0]
 
-            if chosen_asin and re.match(r'^[A-Z0-9]{10}$', chosen_asin, flags=re.I):
+            # stricter validation: ASIN must be 10 alnum chars AND include at least one digit
+            valid_asin = False
+            if chosen_asin and re.match(r'^[A-Z0-9]{10}$', chosen_asin, flags=re.I) and re.search(r'\d', chosen_asin):
+                valid_asin = True
+
+            if valid_asin:
                 short = f"https://www.amazon.in/dp/{chosen_asin}/?tag={AFFILIATE_TAG}"
                 replacement = short
                 print(f"🔁 Amazon converted: {orig_u[:80]} -> {replacement}")
@@ -309,11 +325,20 @@ async def convert_amazon_async(text):
                         replaced = replaced + "?tag=" + AFFILIATE_TAG
                 replacement = replaced
                 print(f"ℹ️ Amazon: no valid ASIN; using original+tag for {orig_u[:80]}")
+                # log fallback for auditing
+                try:
+                    _log_fallback(orig_u, chosen_asin, replacement)
+                except Exception:
+                    pass
 
             # finally replace in new_text
             new_text = new_text.replace(orig_u, replacement)
         except Exception as e:
             print("⚠️ convert_amazon_async error for", u, e)
+            try:
+                _log_fallback(orig_u, None, orig_u)
+            except Exception:
+                pass
     return new_text
 
 # ---------------- EarnKaro conversion (kept intact) ---------------- #
@@ -346,7 +371,7 @@ async def convert_earnkaro(text):
 async def process(text):
     # expand shorteners first
     t = await expand_all(text)
-    # convert amazon (no network verification)
+    # convert amazon (no network verification, stricter ASIN validation)
     t = await convert_amazon_async(t)
     # earnkaro conversion (if enabled)
     t = await convert_earnkaro(t)
