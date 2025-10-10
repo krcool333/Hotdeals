@@ -1,5 +1,5 @@
 # app.py - FASTDEALS Bot (final, ready-to-paste)
-# - ASIN validator + fallback (verify short link; fallback to original with tag if invalid)
+# - ASIN pattern validation (no network verification for short links) — faster
 # - Night pause removed
 # - Keeps multi-channel sources, dedupe, EarnKaro, media fallback, render ping, etc.
 import os
@@ -207,7 +207,7 @@ async def expand_all(text):
                 print(f"⚠️ Expansion failed for {u}: {e}")
     return text
 
-# ---------------- Improved Amazon canonicalizer (async with verification) ---------------- #
+# ---------------- Improved Amazon canonicalizer (no network verification) ---------------- #
 def _find_asins_in_string(s):
     """Return list of all 10-char alnum sequences that look like ASINs (uppercased)."""
     tokens = re.findall(r'([A-Z0-9]{10})', s, flags=re.I)
@@ -233,7 +233,7 @@ async def convert_amazon_async(text):
     - Extract ASINs from many patterns.
     - If multiple ASINs exist, choose the most frequent ASIN.
     - Build short link https://www.amazon.in/dp/<ASIN>/?tag=<AFFILIATE_TAG>.
-    - Verify short link by requesting it; if verification fails, fall back to original URL with tag appended.
+    - NO network verification (faster). If no valid ASIN found, fallback to original URL with tag appended.
     - Does NOT append 'More (full list)' — single short link only (or fallback original+tag).
     """
     if not text:
@@ -251,98 +251,69 @@ async def convert_amazon_async(text):
         return text
 
     new_text = text
-    timeout = aiohttp.ClientTimeout(total=6)
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36"}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        for u in sorted(set(urls), key=lambda x: -len(x)):  # longer first to avoid partial matches
-            orig_u = u
+    for u in sorted(set(urls), key=lambda x: -len(x)):  # longer first to avoid partial matches
+        orig_u = u
+        try:
+            # decode double-encoded artifacts
             try:
-                # decode double-encoded artifacts
+                u_dec = unquote(unquote(u))
+            except Exception:
                 try:
-                    u_dec = unquote(unquote(u))
+                    u_dec = unquote(u)
                 except Exception:
-                    try:
-                        u_dec = unquote(u)
-                    except Exception:
-                        u_dec = u
+                    u_dec = u
 
-                # Collect ASIN candidates
-                asins = []
+            # Collect ASIN candidates
+            asins = []
 
-                # pattern /dp/ASIN or /gp/product/ASIN
-                m = re.findall(r'/dp/([A-Z0-9]{10})', u_dec, flags=re.I)
-                if m:
-                    asins.extend([x.upper() for x in m])
-                m2 = re.findall(r'/gp/(?:product|aw/d)/([A-Z0-9]{10})', u_dec, flags=re.I)
-                if m2:
-                    asins.extend([x.upper() for x in m2])
+            # pattern /dp/ASIN or /gp/product/ASIN
+            m = re.findall(r'/dp/([A-Z0-9]{10})', u_dec, flags=re.I)
+            if m:
+                asins.extend([x.upper() for x in m])
+            m2 = re.findall(r'/gp/(?:product|aw/d)/([A-Z0-9]{10})', u_dec, flags=re.I)
+            if m2:
+                asins.extend([x.upper() for x in m2])
 
-                # query string asin or asin list
-                try:
-                    qs = parse_qs(urlparse(u_dec).query)
-                    q_asin = _first_asin_from_qs(qs)
-                    if q_asin:
-                        asins.append(q_asin)
-                except Exception:
-                    pass
+            # query string asin or asin list
+            try:
+                qs = parse_qs(urlparse(u_dec).query)
+                q_asin = _first_asin_from_qs(qs)
+                if q_asin:
+                    asins.append(q_asin)
+            except Exception:
+                pass
 
-                # fallback: any 10-char tokens
-                fallback = _find_asins_in_string(u_dec)
-                if fallback:
-                    asins.extend(fallback)
+            # fallback: any 10-char tokens
+            fallback = _find_asins_in_string(u_dec)
+            if fallback:
+                asins.extend(fallback)
 
-                # sanitize order & choose ASIN
-                chosen_asin = None
-                if asins:
-                    # pick the most common ASIN among candidates
-                    count = Counter(asins)
-                    chosen_asin = count.most_common(1)[0][0]
+            # sanitize order & choose ASIN
+            chosen_asin = None
+            if asins:
+                # pick the most common ASIN among candidates
+                count = Counter(asins)
+                chosen_asin = count.most_common(1)[0][0]
 
-                if chosen_asin and re.match(r'^[A-Z0-9]{10}$', chosen_asin, flags=re.I):
-                    short = f"https://www.amazon.in/dp/{chosen_asin}/?tag={AFFILIATE_TAG}"
+            if chosen_asin and re.match(r'^[A-Z0-9]{10}$', chosen_asin, flags=re.I):
+                short = f"https://www.amazon.in/dp/{chosen_asin}/?tag={AFFILIATE_TAG}"
+                replacement = short
+                print(f"🔁 Amazon converted: {orig_u[:80]} -> {replacement}")
+            else:
+                # no valid ASIN found: ensure tag param present (append if missing)
+                replaced = re.sub(r'([?&])tag=[^&\s]+', r'\1tag=' + AFFILIATE_TAG, orig_u)
+                if 'tag=' not in replaced:
+                    if '?' in replaced:
+                        replaced = replaced + "&tag=" + AFFILIATE_TAG
+                    else:
+                        replaced = replaced + "?tag=" + AFFILIATE_TAG
+                replacement = replaced
+                print(f"ℹ️ Amazon: no valid ASIN; using original+tag for {orig_u[:80]}")
 
-                    # verify short link (GET with redirects) — if it looks valid, use it
-                    try:
-                        async with session.get(short, allow_redirects=True) as resp:
-                            status = resp.status
-                            # Accept 2xx or 3xx (redirects) as valid; otherwise consider invalid
-                            if 200 <= status < 400:
-                                replacement = short
-                                print(f"🔁 Amazon converted and verified: {orig_u[:80]} -> {replacement} (status={status})")
-                            else:
-                                # fallback to original URL with tag
-                                replaced = re.sub(r'([?&])tag=[^&\s]+', r'\1tag=' + AFFILIATE_TAG, orig_u)
-                                if 'tag=' not in replaced:
-                                    if '?' in replaced:
-                                        replaced = replaced + "&tag=" + AFFILIATE_TAG
-                                    else:
-                                        replaced = replaced + "?tag=" + AFFILIATE_TAG
-                                replacement = replaced
-                                print(f"⚠️ Short link verification failed (status={status}) - falling back to original+tag for {orig_u[:80]}")
-                    except Exception as e:
-                        # network or blocked — fallback to original with tag
-                        replaced = re.sub(r'([?&])tag=[^&\s]+', r'\1tag=' + AFFILIATE_TAG, orig_u)
-                        if 'tag=' not in replaced:
-                            if '?' in replaced:
-                                replaced = replaced + "&tag=" + AFFILIATE_TAG
-                            else:
-                                replaced = replaced + "?tag=" + AFFILIATE_TAG
-                        replacement = replaced
-                        print(f"⚠️ Short link verification exception - falling back to original+tag for {orig_u[:80]}: {e}")
-                else:
-                    # no valid ASIN found: ensure tag param present (append if missing)
-                    replaced = re.sub(r'([?&])tag=[^&\s]+', r'\1tag=' + AFFILIATE_TAG, orig_u)
-                    if 'tag=' not in replaced:
-                        if '?' in replaced:
-                            replaced = replaced + "&tag=" + AFFILIATE_TAG
-                        else:
-                            replaced = replaced + "?tag=" + AFFILIATE_TAG
-                    replacement = replaced
-                    print(f"ℹ️ Amazon: no valid ASIN; using original+tag for {orig_u[:80]}")
-                # finally replace in new_text
-                new_text = new_text.replace(orig_u, replacement)
-            except Exception as e:
-                print("⚠️ convert_amazon_async error for", u, e)
+            # finally replace in new_text
+            new_text = new_text.replace(orig_u, replacement)
+        except Exception as e:
+            print("⚠️ convert_amazon_async error for", u, e)
     return new_text
 
 # ---------------- EarnKaro conversion (kept intact) ---------------- #
@@ -375,7 +346,7 @@ async def convert_earnkaro(text):
 async def process(text):
     # expand shorteners first
     t = await expand_all(text)
-    # convert amazon and verify (async)
+    # convert amazon (no network verification)
     t = await convert_amazon_async(t)
     # earnkaro conversion (if enabled)
     t = await convert_earnkaro(t)
@@ -711,7 +682,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
             base_interval = MIN_INTERVAL_SECONDS
         need_wait = base_interval + random.randint(MIN_JITTER, MAX_JITTER)
         if (now_ts - last) < need_wait:
-            print(f"⏱️ Rate limit: skip {channel_name}. Need {int(need_wait - (now_ts - last))}s more.")
+            print(f"⏱️ Rate limit: skip {channel_name}. Need {int(need_wait - (now - last))}s more.")
             return False
 
         # small jitter before sending (stagger across channels)
