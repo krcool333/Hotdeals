@@ -1,7 +1,10 @@
 # app.py - FASTDEALS Bot (ready-to-paste)
-# All previous features preserved + Channel 3 + strict ASIN rules + amazon_fallbacks.log
-# New: beautify_deal_message() formats ALL deals (Amazon/Flipkart/Myntra/Ajio/other)
-#       when it detects ₹ price patterns (Option B). No extra network calls, negligible overhead.
+# - Multi-channel repost bot with per-channel beautify formatting toggles
+# - Strict Amazon ASIN handling + fallback to original+tag
+# - EarnKaro support retained
+# - Per-channel dedupe, per-channel rate limits, health endpoints, redeploy hooks
+# - No night pause. Pillow overlay kept but not used by default.
+
 import os
 import re
 import time
@@ -44,6 +47,11 @@ CHANNEL_ID_3 = int(os.getenv("CHANNEL_ID_3", "0") or 0)
 USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
 USE_CHANNEL_2 = os.getenv("USE_CHANNEL_2", "true").lower() == "true"
 USE_CHANNEL_3 = os.getenv("USE_CHANNEL_3", "false").lower() == "true"
+
+# New per-channel formatting toggles
+FORMAT_CHANNEL_1 = os.getenv("FORMAT_CHANNEL_1", "true").lower() == "true"
+FORMAT_CHANNEL_2 = os.getenv("FORMAT_CHANNEL_2", "true").lower() == "true"
+FORMAT_CHANNEL_3 = os.getenv("FORMAT_CHANNEL_3", "false").lower() == "true"
 
 AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "lootfastdeals-21")
 USE_EARNKARO = os.getenv("USE_EARNKARO", "false").lower() == "true"
@@ -105,6 +113,7 @@ SHORT_PATTERNS = [
     r"(https?://fkt\.co/\S+)"
 ]
 
+# Default global hashtags (fallback)
 HASHTAG_SETS = [
     "#LootDeals #Discount #OnlineShopping",
     "#FAST #Offer #Sale",
@@ -115,6 +124,21 @@ HASHTAG_SETS = [
     "#TrendingOffers #SaveMoreHotOffer",
     "#DesiDeals #BestBuy #Discount",
 ]
+
+# Channel-specific hashtag sets (can be customized)
+CHANNEL_HASHTAGS = {
+    # channel_id: list or string (we'll pick one at random if list)
+    CHANNEL_ID: ["#LootFast #HotDeals #StealOffer"],
+    CHANNEL_ID_2: ["#CrazyLoot #DealZone #OfferAlert"],
+    CHANNEL_ID_3: ["#DealsKing #BestOffers #DailyLoot"],
+}
+
+# Channel-specific emoji packs (for style in beautifier)
+CHANNEL_EMOJI = {
+    CHANNEL_ID: ["🔥", "💥", "🛒"],
+    CHANNEL_ID_2: ["⚡", "🎁", "🤑"],
+    CHANNEL_ID_3: ["👑", "✨", "🏷️"],
+}
 
 # ---------------- Runtime state ---------------- #
 seen_urls = set()
@@ -336,22 +360,42 @@ def _first_url(text):
     return m.group(1) if m else ""
 
 def _parse_price_token(tok):
-    # normalize numbers like 1,234 to 1234 (int)
     num = re.sub(r'[^\d]', '', tok)
     try:
         return int(num) if num else None
     except Exception:
         return None
 
-def beautify_deal_message(raw_text):
+def get_channel_style_for_formatting(target_channel_id):
+    """Return channel-specific style: emoji list and hashtag string (picked from CHANNEL_HASHTAGS)."""
+    # Default fallback styles
+    default_emoji = ["🔥", "🛒", "✨"]
+    default_hashtag = random.choice(HASHTAG_SETS)
+
+    emoji = CHANNEL_EMOJI.get(target_channel_id, default_emoji)
+    hashtags_list = CHANNEL_HASHTAGS.get(target_channel_id)
+    if isinstance(hashtags_list, list):
+        hashtag = random.choice(hashtags_list)
+    elif isinstance(hashtags_list, str):
+        hashtag = hashtags_list
+    else:
+        hashtag = default_hashtag
+    return {"emoji": emoji, "hashtag": hashtag}
+
+def beautify_deal_message(raw_text, target_channel_id):
     """
     Attempt to extract structured information and produce a clean multi-line post.
     Applies to all deals when a ₹ price is present (Option B).
     Fields extracted (best-effort): product name, was_price, now_price, discount %, rating, free delivery, bought count.
+    Uses channel-specific emoji/hashtag style.
     If not enough info, returns None so caller can keep original message.
     """
     if not raw_text or "₹" not in raw_text:
         return None
+
+    style = get_channel_style_for_formatting(target_channel_id)
+    emoji_pack = style.get("emoji", [])
+    hashtag = style.get("hashtag", "")
 
     # Normalize whitespace and lines
     lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
@@ -360,7 +404,7 @@ def beautify_deal_message(raw_text):
     # Extract first URL (to be appended later)
     link = _first_url(raw_text) or ""
 
-    # Try to extract prices: look for patterns "₹123", "Rs. 123", "₹ 1,234"
+    # Prices: "₹1,234", "Rs. 1,234", etc.
     price_tokens = re.findall(r'₹\s*[0-9\.,]+', raw_text)
     prices = [_parse_price_token(t) for t in price_tokens if _parse_price_token(t) is not None]
 
@@ -388,32 +432,33 @@ def beautify_deal_message(raw_text):
     # Free delivery detection
     free_delivery = bool(re.search(r'free\s+delivery', raw_text, flags=re.I))
 
-    # Product name: best-effort - take first line that isn't just "Buy Here" or a link and not all-uppercase promos
+    # Product name: best-effort - take first line that isn't just "Buy Here" or a link and not promo-only
     product_name = None
     for ln in lines[:3]:
         if "http" in ln.lower() or "buy here" in ln.lower() or len(ln) < 4:
             continue
-        # avoid lines heavily promo-like (e.g., "🔥 LOOT FROM 49/-")
         if len(re.sub(r'[^A-Za-z0-9 ]', '', ln)) < 4:
             continue
         product_name = ln
         break
     if not product_name:
-        # fallback: take first 40 chars of joined text up to first "http" or "₹"
         snippet = re.split(r'http|₹', text_join)[0].strip()
         product_name = snippet[:80].strip() if snippet else None
 
-    # If we don't have at least a now_price or a product name, bail out
     now_price = prices[0] if prices else None
     was_price = prices[1] if len(prices) > 1 else None
 
     if not product_name and not now_price:
         return None
 
-    # Build formatted message (plain text, no markdown tokens to avoid parse issues)
+    # Build formatted message (plain text, no markdown parse mode)
     parts = []
+
+    # header with emoji (pick first emoji)
+    header_emoji = emoji_pack[0] + " " if emoji_pack else ""
     if product_name:
-        parts.append(f"🏷️ GENUINE DEAL: {product_name}")
+        parts.append(f"{header_emoji}GENUINE DEAL: {product_name}")
+
     price_line = ""
     if was_price:
         price_line += f"💰 Was: ₹{was_price:,}"
@@ -425,6 +470,7 @@ def beautify_deal_message(raw_text):
         price_line += f" ({disc} OFF)"
     if price_line:
         parts.append(price_line)
+
     extra = []
     if rating:
         extra.append(f"⭐ {rating}/5")
@@ -434,11 +480,13 @@ def beautify_deal_message(raw_text):
         extra.append(f"📦 {bought}+ bought")
     if extra:
         parts.append(" | ".join(extra))
+
     if link:
         parts.append(f"🔗 {link}")
-    # Add a short hashtag line
-    parts.append("")  # blank line for separation
-    parts.append(random.choice(HASHTAG_SETS))
+
+    parts.append("")  # blank line
+    parts.append(hashtag or random.choice(HASHTAG_SETS))
+
     return "\n".join(parts)
 
 # ---------------- image helpers ---------------- #
@@ -660,14 +708,22 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         else:
             label = "🎯 Fast Deal:\n"
 
-        # Build final message: use beautifier (Option B) if it detects prices
-        # Beautifier uses the processed text (which already has affiliate conversions)
-        beautified = beautify_deal_message(processed)
+        # Decide whether to apply beautify formatting based on target channel flags
+        apply_format = False
+        if target_channel == CHANNEL_ID and FORMAT_CHANNEL_1 and USE_CHANNEL_1:
+            apply_format = True
+        elif target_channel == CHANNEL_ID_2 and FORMAT_CHANNEL_2 and USE_CHANNEL_2:
+            apply_format = True
+        elif target_channel == CHANNEL_ID_3 and FORMAT_CHANNEL_3 and USE_CHANNEL_3:
+            apply_format = True
+
+        beautified = None
+        if apply_format:
+            beautified = beautify_deal_message(processed, target_channel)
+
         if beautified:
-            # Already includes hashtags line; ensure label & spacing
             final_msg = label + "\n" + beautified
         else:
-            # fallback: truncated processed + hashtags
             final_msg = label + truncate_message(processed) + f"\n\n{choose_hashtags()}"
 
         print(f"📤 [{channel_name}] Prepared message: {final_msg[:160]}...")
