@@ -1,15 +1,7 @@
-# app.py - FASTDEALS Bot (ready-to-paste) -- Added Channel 3 (Deals King)
-# Features preserved:
-# - Strict ASIN validation (avoid broken dp/ links), fallback to original+tag
-# - EarnKaro support kept
-# - No night pause
-# - Per-channel dedupe, per-channel rate-limits (overrides possible)
-# - Media handling (telegram media or OG-image)
-# - Caption truncation + follow-up full text
-# - Admin notifications with cooldown
-# - Render redeploy + keepalive + health endpoints
-# - Logs amazon fallbacks to amazon_fallbacks.log
-
+# app.py - FASTDEALS Bot (ready-to-paste)
+# All previous features preserved + Channel 3 + strict ASIN rules + amazon_fallbacks.log
+# New: beautify_deal_message() formats ALL deals (Amazon/Flipkart/Myntra/Ajio/other)
+#       when it detects ₹ price patterns (Option B). No extra network calls, negligible overhead.
 import os
 import re
 import time
@@ -29,7 +21,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
-# Optional Pillow for overlays; NOT required
+# Optional Pillow for overlays; kept for compatibility but not used by default
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -47,12 +39,11 @@ SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0") or 0)
 CHANNEL_ID_2 = int(os.getenv("CHANNEL_ID_2", "0") or 0)
-CHANNEL_ID_3 = int(os.getenv("CHANNEL_ID_3", "0") or 0)  # NEW: Deals King target channel id
+CHANNEL_ID_3 = int(os.getenv("CHANNEL_ID_3", "0") or 0)
 
-# Channel control
 USE_CHANNEL_1 = os.getenv("USE_CHANNEL_1", "true").lower() == "true"
 USE_CHANNEL_2 = os.getenv("USE_CHANNEL_2", "true").lower() == "true"
-USE_CHANNEL_3 = os.getenv("USE_CHANNEL_3", "false").lower() == "true"  # default false
+USE_CHANNEL_3 = os.getenv("USE_CHANNEL_3", "false").lower() == "true"
 
 AFFILIATE_TAG = os.getenv("AFFILIATE_TAG", "lootfastdeals-21")
 USE_EARNKARO = os.getenv("USE_EARNKARO", "false").lower() == "true"
@@ -63,18 +54,16 @@ PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "500"))
 
 ADMIN_NOTIFY = os.getenv("ADMIN_NOTIFY", "").strip()
 RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK", "").strip()
-
 RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 EXTERNAL_URL = os.getenv("EXTERNAL_URL", "").strip()
 
-# Rate limiting & backoff
 MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))
 MIN_INTERVAL_SECONDS_CHANNEL_1 = int(os.getenv("MIN_INTERVAL_SECONDS_CHANNEL_1", str(MIN_INTERVAL_SECONDS)))
 MIN_INTERVAL_SECONDS_CHANNEL_2 = int(os.getenv("MIN_INTERVAL_SECONDS_CHANNEL_2", str(MIN_INTERVAL_SECONDS)))
-MIN_INTERVAL_SECONDS_CHANNEL_3 = int(os.getenv("MIN_INTERVAL_SECONDS_CHANNEL_3", str(MIN_INTERVAL_SECONDS)))  # new
+MIN_INTERVAL_SECONDS_CHANNEL_3 = int(os.getenv("MIN_INTERVAL_SECONDS_CHANNEL_3", str(MIN_INTERVAL_SECONDS)))
 
 MIN_JITTER = int(os.getenv("MIN_JITTER", "3"))
 MAX_JITTER = int(os.getenv("MAX_JITTER", "12"))
@@ -84,7 +73,7 @@ REDEPLOY_BACKOFF_BASE = int(os.getenv("REDEPLOY_BACKOFF_BASE", "60"))
 _admin_notify_cache = {}
 _ADMIN_NOTIFY_COOLDOWN = int(os.getenv("ADMIN_NOTIFY_COOLDOWN", "600"))
 
-# ---------------- DIFFERENT SOURCES ---------------- #
+# ---------------- Sources ---------------- #
 SOURCE_IDS_CHANNEL_1 = [
     -1001448358487,  # Yaha Everything
     -1001767957702,  # Transparent Deals
@@ -100,7 +89,6 @@ SOURCE_IDS_CHANNEL_2 = [
     -1001351555431   # LOOT लो!! Deals Offers
 ]
 
-# NEW: Channel 3 (Deals King) sources (as requested)
 SOURCE_IDS_CHANNEL_3 = [
     -1001716333902,  # Trick Xpert 2.0
     -1002444882171,  # Under 99rs Loot Deals 🤘🏻
@@ -128,18 +116,18 @@ HASHTAG_SETS = [
     "#DesiDeals #BestBuy #Discount",
 ]
 
-# ---------------- Runtime in-memory state (no Redis) ---------------- #
+# ---------------- Runtime state ---------------- #
 seen_urls = set()
 seen_products = {}
 seen_channel_1 = {}
 seen_channel_2 = {}
-seen_channel_3 = {}  # new
+seen_channel_3 = {}
 last_msg_time = time.time()
 last_sent_channel = {}
 redeploy_count_today = 0
 last_redeploy_time = 0
 
-# ---------------- Session handling ---------------- #
+# ---------------- Session ---------------- #
 if STRING_SESSION:
     print("Using STRING_SESSION from env")
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -213,7 +201,7 @@ async def expand_all(text):
                 print(f"⚠️ Expansion failed for {u}: {e}")
     return text
 
-# ---------------- Amazon conversion (stricter ASIN rules) ---------------- #
+# ---------------- Amazon conversion (strict ASIN, no network verify) ---------------- #
 def _find_asins_in_string(s):
     tokens = re.findall(r'([A-Z0-9]{10})', s, flags=re.I)
     return [t.upper() for t in tokens]
@@ -310,7 +298,7 @@ async def convert_amazon_async(text):
                 pass
     return new_text
 
-# ---------------- EarnKaro conversion (kept intact) ---------------- #
+# ---------------- EarnKaro conversion ---------------- #
 async def convert_earnkaro(text):
     if not USE_EARNKARO:
         return text
@@ -342,64 +330,118 @@ async def process(text):
     t = await convert_earnkaro(t)
     return t
 
-# ---------------- product helpers ---------------- #
-def extract_product_name(text):
-    text_no_urls = re.sub(r'https?://\S+', '', text)
-    patterns = [
-        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper|Fitspire)\s+[^@\n]+?(?=@|₹|http|$)",
-        r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|GB|TB|MB|mAh|MP|Hz))+(?=@|₹|http|$)",
-        r"Upto\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
-        r"Flat\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
-        r"([A-Za-z][^@\n]{10,}?(?=@|₹|http|\n|$))",
-    ]
-    for p in patterns:
-        m = re.search(p, text_no_urls, re.IGNORECASE)
-        if m:
-            prod = m.group(0).strip()
-            prod = re.sub(r'^(Upto|Flat)\s+\d+%\s+Off\s+On\s+', '', prod, flags=re.IGNORECASE)
-            if len(prod) > 10:
-                return prod
-    return None
+# ---------------- Beautify: build attractive post text (Option B: all deals) ---------------- #
+def _first_url(text):
+    m = re.search(r'(https?://\S+)', text)
+    return m.group(1) if m else ""
 
-def canonicalize(url):
-    m = re.search(r'amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})', url, flags=re.I)
-    if m:
-        return f"amazon:{m.group(1)}"
-    if "flipkart.com" in url:
-        pid_match = re.search(r'/p/([a-zA-Z0-9]+)', url) or re.search(r'/itm/([a-zA-Z0-9]+)', url)
-        if pid_match:
-            return f"flipkart:{pid_match.group(1)}"
-    for dom in ["myntra.com", "ajio.com"]:
-        if dom in url:
-            path = url.split("?")[0].rstrip("/")
-            return dom + ":" + path.split("/")[-1] if "/" in path else path
-    return None
+def _parse_price_token(tok):
+    # normalize numbers like 1,234 to 1234 (int)
+    num = re.sub(r'[^\d]', '', tok)
+    try:
+        return int(num) if num else None
+    except Exception:
+        return None
 
-def hash_text(msg):
-    product_name = extract_product_name(msg)
+def beautify_deal_message(raw_text):
+    """
+    Attempt to extract structured information and produce a clean multi-line post.
+    Applies to all deals when a ₹ price is present (Option B).
+    Fields extracted (best-effort): product name, was_price, now_price, discount %, rating, free delivery, bought count.
+    If not enough info, returns None so caller can keep original message.
+    """
+    if not raw_text or "₹" not in raw_text:
+        return None
+
+    # Normalize whitespace and lines
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    text_join = " ".join(lines)
+
+    # Extract first URL (to be appended later)
+    link = _first_url(raw_text) or ""
+
+    # Try to extract prices: look for patterns "₹123", "Rs. 123", "₹ 1,234"
+    price_tokens = re.findall(r'₹\s*[0-9\.,]+', raw_text)
+    prices = [_parse_price_token(t) for t in price_tokens if _parse_price_token(t) is not None]
+
+    # Discount percent (like 65% OFF)
+    disc_match = re.search(r'(\d{1,2}(?:\.\d)?)\s*%[^\w]{0,2}\s*off', raw_text, flags=re.I)
+    disc = None
+    if disc_match:
+        try:
+            disc = f"{float(disc_match.group(1)):.0f}%"
+        except Exception:
+            disc = disc_match.group(1) + "%"
+
+    # Rating patterns: "4.3/5", "4.3 out of 5", "⭐️ 4.3"
+    rating_match = re.search(r'(\d(?:\.\d)?)\s*(?:/5|out of 5|stars?)', raw_text, flags=re.I)
+    rating = rating_match.group(1) if rating_match else None
+
+    # Bought / sold count
+    bought_match = re.search(r'(\d{1,3}(?:[,\d]{0,})?)\s*\+\s*(?:bought|sold|orders|orders today|bought today)', raw_text, flags=re.I)
+    if not bought_match:
+        bought_match = re.search(r'(\d{1,3}(?:[,\d]{0,})?)\s*(?:bought|sold|orders|orders today|bought today)', raw_text, flags=re.I)
+    bought = None
+    if bought_match:
+        bought = bought_match.group(1).replace(",", "")
+
+    # Free delivery detection
+    free_delivery = bool(re.search(r'free\s+delivery', raw_text, flags=re.I))
+
+    # Product name: best-effort - take first line that isn't just "Buy Here" or a link and not all-uppercase promos
+    product_name = None
+    for ln in lines[:3]:
+        if "http" in ln.lower() or "buy here" in ln.lower() or len(ln) < 4:
+            continue
+        # avoid lines heavily promo-like (e.g., "🔥 LOOT FROM 49/-")
+        if len(re.sub(r'[^A-Za-z0-9 ]', '', ln)) < 4:
+            continue
+        product_name = ln
+        break
+    if not product_name:
+        # fallback: take first 40 chars of joined text up to first "http" or "₹"
+        snippet = re.split(r'http|₹', text_join)[0].strip()
+        product_name = snippet[:80].strip() if snippet else None
+
+    # If we don't have at least a now_price or a product name, bail out
+    now_price = prices[0] if prices else None
+    was_price = prices[1] if len(prices) > 1 else None
+
+    if not product_name and not now_price:
+        return None
+
+    # Build formatted message (plain text, no markdown tokens to avoid parse issues)
+    parts = []
     if product_name:
-        clean = re.sub(r"\s+", " ", product_name.lower())
-        clean = re.sub(r"[^\w\s]", "", clean)
-        if len(clean) > 15:
-            return hashlib.md5(clean.encode()).hexdigest()
-    clean = re.sub(r"\s+", " ", msg.lower())
-    urls = re.findall(r'https?://\S+', clean)
-    url_part = "".join(urls)
-    text_part = clean[:100]
-    combined = url_part + text_part
-    return hashlib.md5(combined.encode()).hexdigest()
+        parts.append(f"🏷️ GENUINE DEAL: {product_name}")
+    price_line = ""
+    if was_price:
+        price_line += f"💰 Was: ₹{was_price:,}"
+    if now_price:
+        if price_line:
+            price_line += " | "
+        price_line += f"Now: ₹{now_price:,}"
+    if disc:
+        price_line += f" ({disc} OFF)"
+    if price_line:
+        parts.append(price_line)
+    extra = []
+    if rating:
+        extra.append(f"⭐ {rating}/5")
+    if free_delivery:
+        extra.append("🚚 Free Delivery")
+    if bought:
+        extra.append(f"📦 {bought}+ bought")
+    if extra:
+        parts.append(" | ".join(extra))
+    if link:
+        parts.append(f"🔗 {link}")
+    # Add a short hashtag line
+    parts.append("")  # blank line for separation
+    parts.append(random.choice(HASHTAG_SETS))
+    return "\n".join(parts)
 
-def truncate_message(msg):
-    if len(msg) <= MAX_MSG_LEN:
-        return msg
-    urls = re.findall(r"https?://\S+", msg)
-    more_link = urls[0] if urls else ""
-    return msg[:PREVIEW_LEN] + "...\n👉 More: " + more_link
-
-def choose_hashtags():
-    return random.choice(HASHTAG_SETS)
-
-# ---------------- Image helpers ---------------- #
+# ---------------- image helpers ---------------- #
 async def get_og_image_from_page(url: str, timeout_sec: int = 6):
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
@@ -493,7 +535,7 @@ def build_promotional_image(product_bytes: bytes, badge_text: str = "🔥 Deal",
     except Exception:
         return product_bytes
 
-# ---------------- Send helper ---------------- #
+# ---------------- send helper ---------------- #
 def _extract_first_url(text):
     r = re.search(r'(https?://\S+)', text)
     return r.group(1) if r else ""
@@ -550,23 +592,30 @@ async def send_to_specific_channel(message, channel_id, channel_name, msg_obj=No
         await notify_admin(f"❌ {channel_name} error ({channel_id}): {ex}", error_key=str(ex)[:120])
         return False
 
-# ---------------- Process & send ---------------- #
+# ---------------- process_and_send ---------------- #
 async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg_obj=None):
     if not raw_txt and not getattr(msg_obj, "media", None):
         return False
+
     print(f"📨 [{channel_name}] Raw message: {(raw_txt or '')[:120]}...")
     urls_in_raw = re.findall(r"https?://\S+", raw_txt or "")
     if (not raw_txt or len(raw_txt.strip()) < 20) and not urls_in_raw and not getattr(msg_obj, "media", None):
         print(f"⚠️ [{channel_name}] Skipped: Message too short and no URLs and no media")
         return False
+
     try:
         processed = await process(raw_txt or "")
         urls = re.findall(r"https?://\S+", processed)
+
+        # If no URLs and no media, skip
         if not urls and not getattr(msg_obj, "media", None):
             print(f"⚠️ [{channel_name}] Skipped: No valid URLs found after processing and no media")
             return False
+
         now = time.time()
         dedupe_keys = []
+
+        # dedupe by canonical product keys
         for u in urls:
             c = canonicalize(u)
             if c:
@@ -576,6 +625,8 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
                     print(f"🔗 [{channel_name}] URL dedupe key: {c}")
                 else:
                     print(f"⚠️ [{channel_name}] Duplicate URL skipped (seen {int(now - last_seen)}s ago): {c}")
+
+        # dedupe by text hash
         text_key = hash_text(processed)
         last_seen = seen_dict.get(text_key)
         if not last_seen or (now - last_seen) > DEDUPE_SECONDS:
@@ -583,13 +634,19 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
             print(f"📝 [{channel_name}] Text dedupe key: {text_key}")
         else:
             print(f"⚠️ [{channel_name}] Duplicate text skipped (seen {int(now - last_seen)}s ago): {text_key}")
+
+        # Only skip if BOTH URL and text are duplicates
         if not dedupe_keys:
             print(f"⚠️ [{channel_name}] Skipped: All dedupe keys are duplicates")
             return False
+
+        # Update seen for this channel
         for k in dedupe_keys:
             seen_dict[k] = now
         for u in urls:
             seen_urls.add(u)
+
+        # labels
         label = ""
         all_urls = urls
         if any("amazon" in u for u in all_urls):
@@ -602,9 +659,20 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
             label = "🛍️ Ajio Deal:\n"
         else:
             label = "🎯 Fast Deal:\n"
-        msg = label + truncate_message(processed)
-        msg += f"\n\n{choose_hashtags()}"
-        print(f"📤 [{channel_name}] Prepared message: {msg[:100]}...")
+
+        # Build final message: use beautifier (Option B) if it detects prices
+        # Beautifier uses the processed text (which already has affiliate conversions)
+        beautified = beautify_deal_message(processed)
+        if beautified:
+            # Already includes hashtags line; ensure label & spacing
+            final_msg = label + "\n" + beautified
+        else:
+            # fallback: truncated processed + hashtags
+            final_msg = label + truncate_message(processed) + f"\n\n{choose_hashtags()}"
+
+        print(f"📤 [{channel_name}] Prepared message: {final_msg[:160]}...")
+
+        # --- RATE LIMIT PER CHANNEL (avoid bursts / spam flags) ---
         now_ts = time.time()
         last = last_sent_channel.get(channel_name, 0)
         if channel_name.lower().startswith("channel 1"):
@@ -619,8 +687,12 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         if (now_ts - last) < need_wait:
             print(f"⏱️ Rate limit: skip {channel_name}. Need {int(need_wait - (now - last))}s more.")
             return False
+
+        # small jitter before sending (stagger across channels)
         await asyncio.sleep(random.uniform(0.5, 2.5))
-        success = await send_to_specific_channel(msg, target_channel, channel_name, msg_obj=msg_obj)
+
+        success = await send_to_specific_channel(final_msg, target_channel, channel_name, msg_obj=msg_obj)
+
         if success:
             global last_msg_time
             last_msg_time = time.time()
@@ -630,6 +702,7 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
         else:
             print(f"❌ [{channel_name}] Failed to send")
             return False
+
     except Exception as ex:
         error_msg = f"❌ [{channel_name}] Error processing message: {str(ex)}"
         print(error_msg)
@@ -637,23 +710,79 @@ async def process_and_send(raw_txt, target_channel, channel_name, seen_dict, msg
             await notify_admin(error_msg, error_key="processing_error")
         return False
 
-# ---------------- Bot main ---------------- #
+# ---------------- product helpers ---------------- #
+def extract_product_name(text):
+    text_no_urls = re.sub(r'https?://\S+', '', text)
+    patterns = [
+        r"(?:Samsung|iPhone|OnePlus|Realme|Xiaomi|Redmi|Poco|Motorola|Nokia|LG|Sony|HP|Dell|Lenovo|Asus|Acer|MSI|Canon|Nikon|Boat|JBL|Noise|Fire-Boltt|pTron|Mi|Pepe\s+Jeans|Lee\s+Cooper|Fitspire)\s+[^@\n]+?(?=@|₹|http|$)",
+        r"[A-Z][a-z]+(?:\s+[A-Za-z0-9]+)+?(?:\s+\d+(?:cm|inch|GB|TB|MB|mAh|MP|Hz))+(?=@|₹|http|$)",
+        r"Upto\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
+        r"Flat\s+\d+%+\s+Off\s+On\s+([^@\n]+?)(?=@|₹|http|$)",
+        r"([A-Za-z][^@\n]{10,}?(?=@|₹|http|\n|$))",
+    ]
+    for p in patterns:
+        m = re.search(p, text_no_urls, re.IGNORECASE)
+        if m:
+            prod = m.group(0).strip()
+            prod = re.sub(r'^(Upto|Flat)\s+\d+%\s+Off\s+On\s+', '', prod, flags=re.IGNORECASE)
+            if len(prod) > 10:
+                return prod
+    return None
+
+def canonicalize(url):
+    m = re.search(r'amazon\.(?:com|in)/(?:.*?/)?(?:dp|gp/product)/([A-Z0-9]{10})', url, flags=re.I)
+    if m:
+        return f"amazon:{m.group(1)}"
+    if "flipkart.com" in url:
+        pid_match = re.search(r'/p/([a-zA-Z0-9]+)', url) or re.search(r'/itm/([a-zA-Z0-9]+)', url)
+        if pid_match:
+            return f"flipkart:{pid_match.group(1)}"
+    for dom in ["myntra.com", "ajio.com"]:
+        if dom in url:
+            path = url.split("?")[0].rstrip("/")
+            return dom + ":" + path.split("/")[-1] if "/" in path else path
+    return None
+
+def hash_text(msg):
+    product_name = extract_product_name(msg)
+    if product_name:
+        clean = re.sub(r"\s+", " ", product_name.lower())
+        clean = re.sub(r"[^\w\s]", "", clean)
+        if len(clean) > 15:
+            return hashlib.md5(clean.encode()).hexdigest()
+    clean = re.sub(r"\s+", " ", msg.lower())
+    urls = re.findall(r'https?://\S+', clean)
+    url_part = "".join(urls)
+    text_part = clean[:100]
+    combined = url_part + text_part
+    return hashlib.md5(combined.encode()).hexdigest()
+
+def truncate_message(msg):
+    if len(msg) <= MAX_MSG_LEN:
+        return msg
+    urls = re.findall(r"https?://\S+", msg)
+    more_link = urls[0] if urls else ""
+    return msg[:PREVIEW_LEN] + "...\n👉 More: " + more_link
+
+def choose_hashtags():
+    return random.choice(HASHTAG_SETS)
+
+# ---------------- bot main & deploy helpers ---------------- #
 async def bot_main():
     global last_msg_time, seen_urls, seen_products, seen_channel_1, seen_channel_2, seen_channel_3
     try:
         await client.start()
         me = await client.get_me()
         print(f"✅ Logged in as: {me.first_name} (ID: {me.id})")
-        await client.get_me()
     except Exception as e:
         error_msg = f"❌ Session validation failed: {e}"
         print(error_msg)
         if "two different IP addresses" in str(e):
             await notify_admin("🚨 CRITICAL: Session conflict! Generate NEW STRING_SESSION", error_key="session_conflict")
         return
+
     await notify_admin("🤖 Bot started successfully! Monitoring different sources for each channel.", error_key="bot_started")
 
-    # Connect to source entities for Channel 1
     sources_channel_1 = []
     if USE_CHANNEL_1:
         for i in SOURCE_IDS_CHANNEL_1:
@@ -665,7 +794,6 @@ async def bot_main():
                 print(f"❌ [Channel 1] Failed source {i}: {ex}")
                 await notify_admin(f"❌ [Channel 1] Failed to connect to source {i}: {ex}", error_key=f"src1_{i}")
 
-    # Connect to source entities for Channel 2
     sources_channel_2 = []
     if USE_CHANNEL_2 and CHANNEL_ID_2 and int(CHANNEL_ID_2) != 0:
         for i in SOURCE_IDS_CHANNEL_2:
@@ -677,7 +805,6 @@ async def bot_main():
                 print(f"❌ [Channel 2] Failed source {i}: {ex}")
                 await notify_admin(f"❌ [Channel 2] Failed to connect to source {i}: {ex}", error_key=f"src2_{i}")
 
-    # Connect to source entities for Channel 3 (Deals King)
     sources_channel_3 = []
     if USE_CHANNEL_3 and CHANNEL_ID_3 and int(CHANNEL_ID_3) != 0:
         for i in SOURCE_IDS_CHANNEL_3:
@@ -694,7 +821,6 @@ async def bot_main():
     print(f"   Channel 2: {CHANNEL_ID_2} ({'ENABLED' if USE_CHANNEL_2 else 'DISABLED'}) - {len(sources_channel_2)} sources")
     print(f"   Channel 3: {CHANNEL_ID_3} ({'ENABLED' if USE_CHANNEL_3 else 'DISABLED'}) - {len(sources_channel_3)} sources")
 
-    # handlers
     if USE_CHANNEL_1 and sources_channel_1:
         @client.on(events.NewMessage(chats=sources_channel_1))
         async def handler_channel_1(e):
@@ -708,13 +834,11 @@ async def bot_main():
     if USE_CHANNEL_3 and sources_channel_3:
         @client.on(events.NewMessage(chats=sources_channel_3))
         async def handler_channel_3(e):
-            # This channel mainly posts image-only deals — we still pass msg_obj for media extraction
             await process_and_send(e.message.message or "", int(CHANNEL_ID_3), "Channel 3", seen_channel_3, msg_obj=e.message)
 
     print("🔄 Bot is now actively monitoring different sources for each channel...")
     await client.run_until_disconnected()
 
-# ---------------- Deploy helpers & monitor ---------------- #
 def redeploy_via_hook():
     if not RENDER_DEPLOY_HOOK:
         return False
@@ -778,7 +902,6 @@ def monitor_health():
                 redeploy_count_today += 1
                 last_redeploy_time = time.time()
 
-# ---------------- Keep-alive ping loop ---------------- #
 def keep_alive():
     while True:
         time.sleep(300)
